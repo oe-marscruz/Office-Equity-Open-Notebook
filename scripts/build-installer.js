@@ -21,10 +21,10 @@ const path = require('path');
 const os = require('os');
 
 const PROJECT_DIR = path.join(__dirname, '..');
-const APP_DIR = path.join(PROJECT_DIR, 'out', 'Open Notebook');
+const APP_DIR = path.join(PROJECT_DIR, 'out', 'Office of Equity Open Notebook');
 const DIST_DIR = path.join(PROJECT_DIR, 'dist');
 const VERSION = '1.14.0';
-const PRODUCT_NAME = 'Open Notebook';
+const PRODUCT_NAME = 'Office of Equity Open Notebook';
 const INSTALLER_NAME = `${PRODUCT_NAME}-${VERSION}-Setup.exe`;
 
 function arg(name, def) {
@@ -110,7 +110,7 @@ Unicode true
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "English"
 
-Section "Open Notebook (required)" SecApp
+Section "Office of Equity Open Notebook (required)" SecApp
   SetOutPath "$INSTDIR"
   File /r "OpenNotebook-required\\*"
   WriteUninstaller "$INSTDIR\\Uninstall.exe"

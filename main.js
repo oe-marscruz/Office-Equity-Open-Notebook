@@ -63,7 +63,7 @@ function createWindow() {
     height: 900,
     minWidth: 1024,
     minHeight: 700,
-    title: 'Open Notebook',
+    title: 'Office of Equity Open Notebook',
     backgroundColor: '#0b0b0f',
     autoHideMenuBar: true,
     webPreferences: {
@@ -110,7 +110,7 @@ app.whenReady().then(async () => {
   const missing = required.filter((p) => !fs.existsSync(p));
   if (missing.length > 0) {
     showErrorAndExit(
-      'Open Notebook — runtime not found',
+      'Office of Equity Open Notebook — runtime not found',
       'The bundled runtime is incomplete. Please re-run `npm run prepare:runtime` and rebuild the app.\n\nMissing:\n' +
         missing.join('\n')
     );
@@ -125,7 +125,7 @@ app.whenReady().then(async () => {
       waitReady: true,
     });
   } catch (err) {
-    showErrorAndExit('Open Notebook — failed to start', String(err && err.message));
+    showErrorAndExit('Office of Equity Open Notebook — failed to start', String(err && err.message));
     return;
   }
 

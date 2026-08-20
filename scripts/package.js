@@ -7,7 +7,7 @@
  * which on non-admin Windows fails to extract its code-signing cache (7-Zip
  * cannot create the macOS symlinks without admin/Developer Mode).
  *
- * The output is a runnable `Open Notebook.exe` with the app code and the
+ * The output is a runnable `Office of Equity Open Notebook.exe` with the app code and the
  * bundled runtime in `resources/`.
  *
  * Usage:
@@ -21,7 +21,7 @@ const { spawnSync } = require('child_process');
 const PROJECT_DIR = path.join(__dirname, '..');
 const RUNTIME_DIR = path.join(PROJECT_DIR, 'resources', 'runtime');
 const ELECTRON_DIST = path.join(PROJECT_DIR, 'node_modules', 'electron', 'dist');
-const PRODUCT_NAME = 'Open Notebook';
+const PRODUCT_NAME = 'Office of Equity Open Notebook';
 const VERSION = '1.14.0';
 
 function arg(name, def) {
