@@ -1,0 +1,21 @@
+{
+  "name": "office-of-equity-open-notebook",
+  "productName": "Office of Equity Open Notebook",
+  "version": "1.14.0",
+  "description": "Office of Equity Open Notebook — a job-specific Windows desktop app for the Office of Equity, built on Open Notebook (a private, multi-model, 100% local Notebook LM alternative).",
+  "main": "main.js",
+  "author": {
+    "name": "Office of Equity"
+  },
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "prepare:runtime": "node scripts/prepare-runtime.js",
+    "start": "electron .",
+    "package:app": "node scripts/package.js",
+    "installer": "node scripts/build-installer.js"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0"
+  }
+}
