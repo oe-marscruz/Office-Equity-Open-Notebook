@@ -16,21 +16,7 @@ const { ensureEncryptionKey } = require('./scripts/lib/encryption-key');
 const { PRODUCT_NAME, FRONTEND_URL, RUNTIME_DIR } = require('./scripts/lib/paths');
 const { REQUIRED_RUNTIME_FILES } = require('./scripts/lib/runtime-manifest');
 const { createProblemReport } = require('./scripts/lib/problem-report');
-
-const FRONTEND_ORIGIN = new URL(FRONTEND_URL).origin;
-
-/**
- * True only for the app's own frontend origin. A prefix check would also match
- * look-alike hosts such as `http://127.0.0.1:8502.evil.example`, which could
- * hand a navigation to an attacker-controlled page.
- */
-function isFrontendUrl(url) {
-  try {
-    return new URL(url).origin === FRONTEND_ORIGIN;
-  } catch (_) {
-    return false;
-  }
-}
+const { isFrontendUrl, isExternalHttpUrl } = require('./scripts/lib/window-policy');
 
 function resolveIconPath() {
   // In development this is the repo root; when packaged, `assets/` is copied
@@ -143,16 +129,16 @@ function createWindow() {
 
   // Open external links in the system browser, not inside the app.
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith('http://') || url.startsWith('https://')) {
+    if (isExternalHttpUrl(url)) {
       shell.openExternal(url);
     }
     return { action: 'deny' };
   });
 
   mainWindow.webContents.on('will-navigate', (event, url) => {
-    if (!isFrontendUrl(url)) {
+    if (!isFrontendUrl(url, FRONTEND_URL)) {
       event.preventDefault();
-      if (url.startsWith('http://') || url.startsWith('https://')) {
+      if (isExternalHttpUrl(url)) {
         shell.openExternal(url);
       }
     }
