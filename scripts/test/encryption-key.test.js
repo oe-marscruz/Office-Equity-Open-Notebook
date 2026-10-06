@@ -34,7 +34,10 @@ async function main() {
     const dataDir = makeTempDir('onb-key-');
     const key = ensureEncryptionKey(dataDir);
     assert.match(key, /^[0-9a-f]{64}$/);
-    assert.strictEqual(fs.readFileSync(path.join(dataDir, KEY_FILENAME), 'utf8'), key);
+    // The key file stores the key obfuscated (not in plaintext).
+    const fileContent = fs.readFileSync(path.join(dataDir, KEY_FILENAME), 'utf8');
+    assert.ok(fileContent.startsWith('obf:'), 'key file should use obfuscated format');
+    assert.strictEqual(fileContent.includes(key), false, 'raw key must not appear in the file');
   });
 
   await test('ensureEncryptionKey returns the same key on later calls', async () => {

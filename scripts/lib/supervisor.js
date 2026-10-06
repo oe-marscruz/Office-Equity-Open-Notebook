@@ -1,6 +1,6 @@
 'use strict';
 
-const { spawn, spawnSync, execFileSync } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
 const net = require('net');
 const path = require('path');
@@ -48,22 +48,23 @@ const FORCE_TIMEOUT_MS = 3000;
 /**
  * Returns whether `pid` is still running. Used to confirm that a shutdown
  * actually finished rather than assuming it did.
+ *
+ * Uses Node.js's native `process.kill(pid, 0)` on all platforms. Signal 0
+ * performs error checking without actually sending a signal: it throws ESRCH
+ * if the process does not exist, and succeeds if it does. This works on
+ * Windows too (Node.js implements it via OpenProcess), so we avoid spawning
+ * `tasklist.exe` — which antivirus software often flags as suspicious
+ * process-enumeration behavior.
  */
 function isProcessAlive(pid) {
   if (!pid) return false;
   try {
-    if (IS_WINDOWS) {
-      const out = execFileSync('tasklist', ['/FI', `PID eq ${pid}`, '/NH', '/FO', 'CSV'], {
-        encoding: 'utf8',
-        windowsHide: true,
-        stdio: ['ignore', 'pipe', 'ignore'],
-      });
-      return new RegExp(`"${pid}"`).test(out);
-    }
     process.kill(pid, 0);
     return true;
-  } catch (_) {
-    return false;
+  } catch (error) {
+    // ESRCH means the process is gone; EPERM means it exists but we lack
+    // permission to signal it (still alive).
+    return error && error.code === 'EPERM';
   }
 }
 
@@ -76,9 +77,15 @@ function isProcessAlive(pid) {
  * Electron exit — leaving ports bound and the SurrealDB file locked, which is
  * what makes the next launch fail with "port already in use".
  *
- * Windows uses `taskkill /PID <pid> /T /F`, which is PID-scoped and walks the
- * tree; it is invoked while the root is still alive, because once the root is
- * gone the tree can no longer be discovered. It never matches by image name.
+ * On Windows we use `taskkill /PID <pid> /T /F`, which is PID-scoped and
+ * walks the tree. It is invoked while the root is still alive, because once
+ * the root is gone the tree can no longer be discovered. It never matches by
+ * image name, so it cannot accidentally kill an unrelated process.
+ *
+ * Security note: `taskkill` is a standard Windows system utility. Antivirus
+ * software may flag its use, but this is a legitimate process-management
+ * operation scoped to PIDs we spawned ourselves. The `/PID` flag ensures we
+ * only ever kill our own process tree.
  */
 function killProcessTree(pid, { force = true } = {}) {
   if (!pid) return false;

@@ -21,6 +21,7 @@
     "test:rag": "node scripts/test/rag-test.js"
   },
   "devDependencies": {
+    "asar": "^3.2.0",
     "electron": "^33.2.0"
   }
 }

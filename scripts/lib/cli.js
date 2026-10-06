@@ -25,9 +25,14 @@ function arg(name, def, argv = process.argv) {
 /**
  * Runs a command with inherited stdio, throwing on a non-zero exit code.
  *
- * `npm` is a .cmd shim on Windows and needs a shell; everything else (uv,
- * python, tar, node, rcedit, makensis) is a real exe and must NOT go through a
- * shell, or arguments like `-r <path>` get mangled.
+ * `npm` is a .cmd shim on Windows. We invoke it as `npm.cmd` directly
+ * (without a shell) to avoid the `shell: true` pattern that antivirus
+ * software flags. Everything else (uv, python, tar, node, rcedit, makensis)
+ * is a real exe and must NOT go through a shell, or arguments like
+ * `-r <path>` get mangled.
+ *
+ * All spawned processes use `windowsHide: true` to prevent console windows
+ * from flashing on Windows.
  */
 function commandFailed(res, cmd, args) {
   if (res.error) {
@@ -41,17 +46,32 @@ function commandFailed(res, cmd, args) {
 }
 
 function run(cmd, args, opts = {}) {
-  const shell = opts.shell === true || cmd === 'npm';
-  const res = spawnSync(cmd, args, { stdio: 'inherit', shell, ...opts });
-  const err = commandFailed(res, cmd, args);
+  // Resolve npm to npm.cmd on Windows to avoid shell: true.
+  // Antivirus software flags shell execution as a common malware pattern.
+  const isWindows = process.platform === 'win32';
+  const resolvedCmd = isWindows && cmd === 'npm' ? 'npm.cmd' : cmd;
+  const shell = opts.shell === true;
+  const res = spawnSync(resolvedCmd, args, {
+    stdio: 'inherit',
+    shell,
+    windowsHide: true,
+    ...opts,
+  });
+  const err = commandFailed(res, resolvedCmd, args);
   if (err) throw err;
   return res;
 }
 
 /** Runs a command and returns its trimmed stdout, throwing on a non-zero exit code. */
 function runCapture(cmd, args, opts = {}) {
-  const res = spawnSync(cmd, args, { encoding: 'utf8', ...opts });
-  const err = commandFailed(res, cmd, args);
+  const isWindows = process.platform === 'win32';
+  const resolvedCmd = isWindows && cmd === 'npm' ? 'npm.cmd' : cmd;
+  const res = spawnSync(resolvedCmd, args, {
+    encoding: 'utf8',
+    windowsHide: true,
+    ...opts,
+  });
+  const err = commandFailed(res, resolvedCmd, args);
   if (err) throw err;
   return (res.stdout || '').trim();
 }

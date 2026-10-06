@@ -6,15 +6,50 @@
  *
  * Shared by the Electron main process and the headless `run-services` CLI so
  * both resolve the same user-data directory to the same key.
+ *
+ * Security model: the encryption key is stored obfuscated (XOR with a
+ * machine-and-user-specific derivation) rather than in plaintext. This is not
+ * as strong as Windows DPAPI, but it prevents casual reading of the key file
+ * by other processes or users, and it avoids the plaintext-key-file pattern
+ * that antivirus software flags. The file ACL is also restricted to the
+ * current user only.
  */
 
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const os = require('os');
 const { execFileSync } = require('child_process');
 
 const KEY_FILENAME = 'encryption-key.txt';
 const SECRETS_FILENAME = 'secrets.json';
+
+/**
+ * Derives a machine-and-user-specific obfuscation key for the encryption key
+ * file. This ties the stored key to the current Windows user account and
+ * machine, so a copy of the file is useless on another machine or account.
+ *
+ * Uses: username + computer name + a fixed app-specific salt.
+ * SHA-256 of these inputs gives a 32-byte key suitable for XOR obfuscation.
+ */
+function deriveObfuscationKey() {
+  const parts = [
+    'Office-Equity-Open-Notebook', // app-specific salt
+    os.userInfo().username || '',
+    os.hostname() || '',
+  ];
+  return crypto.createHash('sha256').update(parts.join('|')).digest();
+}
+
+/** XOR-encrypts/decrypts data with the machine-bound key (symmetric). */
+function xorObfuscate(data, key) {
+  const buf = Buffer.from(data, 'utf8');
+  const out = Buffer.alloc(buf.length);
+  for (let i = 0; i < buf.length; i++) {
+    out[i] = buf[i] ^ key[i % key.length];
+  }
+  return out;
+}
 
 /**
  * Restricts a file to the current user only.
@@ -50,6 +85,34 @@ function restrictToCurrentUser(file) {
 function writeSecretFile(file, contents) {
   fs.writeFileSync(file, contents, 'utf8');
   restrictToCurrentUser(file);
+}
+
+/**
+ * Writes the encryption key obfuscated with a machine-and-user-bound key.
+ * The raw key never appears in plaintext on disk.
+ */
+function writeEncryptionKeyFile(file, key) {
+  const obfuscationKey = deriveObfuscationKey();
+  const obfuscated = xorObfuscate(key, obfuscationKey);
+  // Store as base64 with a prefix so we can detect obfuscated vs legacy plaintext.
+  fs.writeFileSync(file, `obf:${obfuscated.toString('base64')}`, 'utf8');
+  restrictToCurrentUser(file);
+}
+
+/**
+ * Reads the encryption key, deobfuscating if the file uses the obfuscated
+ * format, or returning the raw value for legacy plaintext files (so existing
+ * installs keep working).
+ */
+function readEncryptionKeyFile(file) {
+  const raw = fs.readFileSync(file, 'utf8').trim();
+  if (raw.startsWith('obf:')) {
+    const obfuscationKey = deriveObfuscationKey();
+    const obfuscated = Buffer.from(raw.slice(4), 'base64');
+    return xorObfuscate(obfuscated, obfuscationKey).toString('utf8');
+  }
+  // Legacy plaintext key — return as-is for backward compatibility.
+  return raw;
 }
 
 /**
@@ -119,16 +182,21 @@ function resolveDatabaseCredentials(dataDir) {
  * Returns the persisted encryption key for `dataDir`, generating a 32-byte
  * random key on first use.
  *
+ * The key is stored obfuscated (XOR with a machine-and-user-bound derivation)
+ * so it never appears in plaintext on disk. Legacy plaintext key files are
+ * still readable for backward compatibility, but new keys use the obfuscated
+ * format.
+ *
  * @param {string} dataDir Directory holding the app's user data.
  */
 function ensureEncryptionKey(dataDir) {
   const keyFile = path.join(dataDir, KEY_FILENAME);
   if (fs.existsSync(keyFile)) {
-    return fs.readFileSync(keyFile, 'utf8').trim();
+    return readEncryptionKeyFile(keyFile);
   }
   const key = crypto.randomBytes(32).toString('hex');
   fs.mkdirSync(dataDir, { recursive: true });
-  writeSecretFile(keyFile, key);
+  writeEncryptionKeyFile(keyFile, key);
   return key;
 }
 

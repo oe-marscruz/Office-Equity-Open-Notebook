@@ -64,6 +64,48 @@ function sha256File(filePath) {
   });
 }
 
+/**
+ * Verifies the Authenticode digital signature of a Windows executable.
+ *
+ * SHA-256 checksums prove the file matches what we downloaded, but they do
+ * not prove the file is from the expected publisher. Authenticode signature
+ * verification confirms the binary was signed by the vendor (SurrealDB,
+ * Node.js) and has not been tampered with.
+ *
+ * Uses PowerShell's Get-AuthenticodeSignature (a read-only query, not a
+ * script execution) to check the signature status. Returns true if the
+ * signature is valid, false otherwise.
+ *
+ * Security note: this is a verification step, not an execution step. We are
+ * checking a signature, not running the binary.
+ */
+function verifyAuthenticodeSignature(filePath, expectedPublisher) {
+  if (process.platform !== 'win32') return true; // N/A on non-Windows
+  try {
+    const psScript = [
+      `(Get-AuthenticodeSignature -FilePath '${filePath.replace(/'/g, "''")}').Status`,
+    ];
+    const result = runCapture('powershell', ['-NoProfile', '-Command', psScript.join(' ')], {
+      encoding: 'utf8',
+      windowsHide: true,
+    });
+    if (result.trim() !== 'Valid') {
+      return false;
+    }
+    if (expectedPublisher) {
+      const sigInfo = runCapture('powershell', [
+        '-NoProfile',
+        '-Command',
+        `(Get-AuthenticodeSignature -FilePath '${filePath.replace(/'/g, "''")}').SignerCertificate.Subject`,
+      ], { encoding: 'utf8', windowsHide: true });
+      return sigInfo.includes(expectedPublisher);
+    }
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 function download(url, dest, expectedSha256) {
   fs.mkdirSync(path.dirname(dest), { recursive: true });
   const tmp = `${dest}.tmp`;
@@ -284,6 +326,19 @@ async function buildSurreal() {
   const dest = path.join(destDir, 'surreal.exe');
   if (!fs.existsSync(dest)) {
     await download(url, dest, CHECKSUMS.surreal);
+    // Verify the Authenticode signature to confirm the binary is from
+    // SurrealDB and has not been tampered with. This is critical because
+    // antivirus software flags unsigned executables, and a tampered binary
+    // would be a supply-chain attack.
+    log('surreal', 'Verifying Authenticode signature...');
+    if (!verifyAuthenticodeSignature(dest, 'SurrealDB')) {
+      fs.unlinkSync(dest);
+      throw new Error(
+        `SurrealDB binary at ${dest} failed Authenticode signature verification. ` +
+        'The download may be corrupted or tampered with. Delete the file and retry.'
+      );
+    }
+    log('surreal', 'Signature verified');
   }
   log('surreal', `Saved SurrealDB binary to ${dest}`);
 }
@@ -300,14 +355,10 @@ async function buildNode() {
   if (!fs.existsSync(path.join(extractDir, 'node.exe'))) {
     rmrf(extractDir);
     fs.mkdirSync(extractDir, { recursive: true });
-    // Git Bash's tar is GNU tar and misreads Windows drive paths, so use
-    // PowerShell's Expand-Archive for a robust cross-shell extraction.
-    const ps = [
-      '-NoProfile',
-      '-Command',
-      `Expand-Archive -LiteralPath '${zip}' -DestinationPath '${extractDir}' -Force`,
-    ];
-    run('powershell', ps, { timeout: 300000 });
+    // Windows 10+ ships bsdtar (tar.exe) which handles zip archives natively.
+    // Using tar instead of PowerShell's Expand-Archive avoids spawning a
+    // shell process, which antivirus software flags as a suspicious pattern.
+    run('tar', ['-xf', zip, '-C', extractDir], { timeout: 300000 });
   }
 
   const destDir = path.join(RUNTIME_DIR, 'node');
@@ -315,6 +366,18 @@ async function buildNode() {
   // The Node zip ships a top-level folder, so node.exe may sit one level deep.
   const nodeExe = findFile(extractDir, 'node.exe');
   if (!nodeExe) throw new Error('node.exe not found after extraction');
+
+  // Verify the Authenticode signature of node.exe before copying it into
+  // the runtime. Node.js is signed by the Node.js Foundation.
+  log('node', 'Verifying Authenticode signature...');
+  if (!verifyAuthenticodeSignature(nodeExe, 'Node.js Foundation')) {
+    throw new Error(
+      `Node.js binary at ${nodeExe} failed Authenticode signature verification. ` +
+      'The download may be corrupted or tampered with. Delete the cache and retry.'
+    );
+  }
+  log('node', 'Signature verified');
+
   cp(nodeExe, path.join(destDir, 'node.exe'));
   log('node', 'Node.js runtime ready');
 }
@@ -412,3 +475,5 @@ main().catch((err) => {
   console.error('\n❌ Preparation failed:', err && err.message);
   process.exit(1);
 });
+
+module.exports = { verifyAuthenticodeSignature, sha256File, download };
