@@ -305,6 +305,10 @@ neither token surfaces through the other notebook's vector or keyword search. A
 chat answer is additionally checked for cross-notebook quotation and for
 citations that carry an identifier a user can verify.
 
+If no probe token can be found even inside its own notebook, the harness refuses
+to report success — an empty result set would make the isolation checks
+meaningless, so it exits `1` as inconclusive instead of passing misleadingly.
+
 Like the other harnesses, it exits `2` when no API is reachable.
 
 ---

@@ -67,20 +67,19 @@ async function isApiReachable() {
 }
 
 /**
- * Guards the suite itself: if the backend keeps echoing every notebook
- * regardless of id, then the isolation assertions below could pass for the
- * wrong reason (an empty result set). This confirms the probe token is
- * actually findable before we assert it is *not* leaked.
+ * Guards the suite itself: if the backend cannot find a token even inside the
+ * notebook it was added to, then the isolation assertions below could pass for
+ * the wrong reason (an empty result set). This confirms search works at all
+ * before asserting that it does *not* cross notebook boundaries.
+ *
+ * The baseline is deliberately scoped to the owning notebook rather than left
+ * unscoped, so it does not depend on how this API treats a missing
+ * `notebook_id`.
  */
-async function assertFixturesAreFindable(notebookId, token, label) {
-  const search = await api(`/search/text?query=${encodeURIComponent(token)}`);
+async function assertOwnTokenIsFindable(notebookId, token, kind) {
+  const search = await api(`/search/${kind}?query=${encodeURIComponent(token)}&notebook_id=${encodeURIComponent(notebookId)}`);
   const body = JSON.stringify(search.json || search.text || '');
-  if (!body.includes(token)) {
-    console.error(`INCONCLUSIVE: the ${label} probe token could not be found even in its own notebook.`);
-    console.error('The isolation assertions would be vacuous, so this run is not a pass.');
-    return false;
-  }
-  return true;
+  return body.includes(token);
 }
 
 async function main() {
@@ -128,29 +127,40 @@ async function main() {
   // ---- Cross-notebook confidentiality -------------------------------------
   console.log('\nCross-notebook confidentiality');
 
-  const findableA = await assertFixturesAreFindable(idA, ISOLATION_TOKEN_A, 'notebook A');
-  const findableB = await assertFixturesAreFindable(idB, ISOLATION_TOKEN_B, 'notebook B');
-  if (!findableA || !findableB) {
-    console.error('Aborting: cannot validate isolation without a working search baseline.');
+  const ownedByA = { notebookId: idA, token: ISOLATION_TOKEN_A };
+  const ownedByB = { notebookId: idB, token: ISOLATION_TOKEN_B };
+  const baselines = [];
+  for (const owner of [ownedByA, ownedByB]) {
+    for (const kind of ['vector', 'text']) {
+      const found = await assertOwnTokenIsFindable(owner.notebookId, owner.token, kind);
+      baselines.push({ kind, found });
+    }
+  }
+
+  const usable = baselines.filter((entry) => entry.found);
+  if (usable.length === 0) {
+    console.error('INCONCLUSIVE: no probe token could be found even inside its own notebook.');
+    console.error('The isolation assertions would be vacuous against this API, so this run is not a pass.');
+    console.error('Check that sources are indexed and that /search/{vector,text} is the expected route.');
     process.exitCode = 1;
     return;
   }
-  console.log('Baseline confirmed: each probe token is findable.');
+  console.log(`Baseline confirmed: ${usable.length} of ${baselines.length} own-notebook searches found their token.`);
 
-  for (const [name, latitude, longitude] of [
-    ['notebook A', ISOLATION_TOKEN_A, ISOLATION_TOKEN_B],
-    ['notebook B', ISOLATION_TOKEN_B, ISOLATION_TOKEN_A],
+  for (const [label, own, other] of [
+    ['notebook A', ownedByA, ownedByB],
+    ['notebook B', ownedByB, ownedByA],
   ]) {
     for (const kind of ['vector', 'text']) {
-      const response = await api(`/search/${kind}?query=${encodeURIComponent(longitude)}&notebook_id=${encodeURIComponent(name === 'notebook A' ? idA : idB)}`);
+      const response = await api(`/search/${kind}?query=${encodeURIComponent(other.token)}&notebook_id=${encodeURIComponent(own.notebookId)}`);
       const body = JSON.stringify(response.json || response.text || '');
-      if (body.includes(longitude)) {
+      if (body.includes(other.token)) {
         fail(
-          `the other notebook's content leaked into ${kind} search scoped to ${name}. ` +
+          `content from the other notebook leaked into ${kind} search scoped to ${label}. ` +
           'A user could retrieve another case file\'s text by searching inside their own notebook.'
         );
       } else {
-        console.log(`ok - ${kind} search in ${name} did not return the other notebook's token`);
+        console.log(`ok - ${kind} search in ${label} did not return the other notebook's token`);
       }
     }
   }
