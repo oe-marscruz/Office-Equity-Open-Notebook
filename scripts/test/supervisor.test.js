@@ -25,6 +25,31 @@ function makeTempDir(prefix) {
   return directory;
 }
 
+// Windows can briefly hold a file lock after a write stream ends, so retry
+// the recursive delete a few times before giving up.
+function rmrfRetry(directory, attempts = 5) {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      fs.rmSync(directory, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      if (i === attempts - 1) throw error;
+      const delay = 50 * (i + 1);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
+    }
+  }
+}
+
+function cleanupFixtures() {
+  for (const directory of fixtures) {
+    try {
+      rmrfRetry(directory);
+    } catch (_) {
+      // Best-effort cleanup; leftover temp dirs are harmless.
+    }
+  }
+}
+
 function listen(server, port = 0) {
   return new Promise((resolve, reject) => {
     server.once('error', reject);
@@ -313,12 +338,12 @@ async function main() {
     );
   });
 
-  fixtures.forEach((directory) => fs.rmSync(directory, { recursive: true, force: true }));
+  cleanupFixtures();
   console.log(`\n${passed} supervisor tests passed`);
 }
 
 main().catch((error) => {
-  fixtures.forEach((directory) => fs.rmSync(directory, { recursive: true, force: true }));
+  cleanupFixtures();
   console.error(error);
   process.exitCode = 1;
 });
