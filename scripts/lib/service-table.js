@@ -9,7 +9,7 @@ const STARTUP_TIMEOUTS = {
   frontend: 180000,
 };
 
-function buildBackendEnv({ dataDir, encryptionKey, tiktokenCache, backendPath, env = process.env }) {
+function buildBackendEnv({ dataDir, encryptionKey, tiktokenCache, backendPath, env = process.env, surrealUser = 'root', surrealPassword = 'root' }) {
   return {
     ...env,
     PYTHONPATH: backendPath,
@@ -17,8 +17,8 @@ function buildBackendEnv({ dataDir, encryptionKey, tiktokenCache, backendPath, e
     PYTHONUTF8: '1',
     DATA_FOLDER: path.join(dataDir, 'data'),
     SURREAL_URL,
-    SURREAL_USER: 'root',
-    SURREAL_PASSWORD: 'root',
+    SURREAL_USER: surrealUser,
+    SURREAL_PASSWORD: surrealPassword,
     SURREAL_NAMESPACE: 'open_notebook',
     SURREAL_DATABASE: 'open_notebook',
     OPEN_NOTEBOOK_ENCRYPTION_KEY: encryptionKey,
@@ -29,7 +29,7 @@ function buildBackendEnv({ dataDir, encryptionKey, tiktokenCache, backendPath, e
   };
 }
 
-function serviceTable({ runtimePath, dataDir, backendPath, pythonExe, nodeExe, encryptionKey, env = process.env, backendEnv }) {
+function serviceTable({ runtimePath, dataDir, backendPath, pythonExe, nodeExe, encryptionKey, env = process.env, backendEnv, surrealUser = 'root', surrealPassword = 'root' }) {
   const resolvedBackendPath = backendPath || path.join(runtimePath, 'backend');
   const commonEnv = backendEnv || buildBackendEnv({
     dataDir,
@@ -37,6 +37,8 @@ function serviceTable({ runtimePath, dataDir, backendPath, pythonExe, nodeExe, e
     tiktokenCache: path.join(runtimePath, 'tiktoken-cache'),
     backendPath: resolvedBackendPath,
     env,
+    surrealUser,
+    surrealPassword,
   });
   const frontendEnv = {
     ...env,
@@ -51,7 +53,7 @@ function serviceTable({ runtimePath, dataDir, backendPath, pythonExe, nodeExe, e
     {
       name: 'surrealdb',
       cmd: path.join(runtimePath, 'surreal', 'surreal.exe'),
-      args: ['start', '--log', 'info', '--user', 'root', '--pass', 'root', '--bind', `127.0.0.1:${PORTS.surreal}`, `rocksdb:${surrealDbFile}`],
+      args: ['start', '--log', 'info', '--user', surrealUser, '--pass', surrealPassword, '--bind', `127.0.0.1:${PORTS.surreal}`, `rocksdb:${surrealDbFile}`],
       cwd: dataDir,
       env: commonEnv,
       readyPort: PORTS.surreal,
@@ -77,6 +79,9 @@ function serviceTable({ runtimePath, dataDir, backendPath, pythonExe, nodeExe, e
     {
       name: 'worker',
       cmd: pythonExe,
+      // `--max-tasks` caps *concurrent* tasks; the worker listens for commands
+      // indefinitely. It is therefore a long-lived daemon that should only
+      // ever exit when we shut it down.
       args: ['-m', 'surreal_commands.cli.worker', '--import-modules', 'commands', '--max-tasks', '5'],
       cwd: resolvedBackendPath,
       env: commonEnv,
@@ -100,4 +105,4 @@ function serviceTable({ runtimePath, dataDir, backendPath, pythonExe, nodeExe, e
   ];
 }
 
-module.exports = { buildBackendEnv, serviceTable };
+module.exports = { buildBackendEnv, serviceTable, STARTUP_TIMEOUTS };

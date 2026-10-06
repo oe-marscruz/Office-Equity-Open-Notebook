@@ -1,0 +1,22 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    name: Unit tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      # Covers the Electron wrapper layer only: runtime verification, problem
+      # reporting, interpreter resolution, credential handling, and the service
+      # supervisor. It needs no assembled runtime, so it stays fast and always
+      # runnable on a clean runner.
+      - name: Run unit tests
+        run: npm test

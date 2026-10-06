@@ -237,6 +237,82 @@ Office of Equity Open Notebook.exe
 
 ---
 
+## 🧪 Testing
+
+### Unit tests
+
+```bash
+npm test
+```
+
+Covers the desktop wrapper layer only — runtime verification, problem reporting,
+interpreter resolution, credential handling, the service supervisor, and
+security/compliance invariants. No assembled runtime is required, so this runs
+on any machine and in CI.
+
+### Security and compliance tests
+
+The security suite runs as part of `npm test` (no stack needed) and asserts the
+properties the Office of Equity depends on:
+
+- **Navigation containment** — the app window cannot be steered to a look-alike
+  host, a different port on the same host, or a non-web scheme.
+- **Secret confidentiality** — the database password is never the well-known
+  default, never reaches the frontend process, and the notebook encryption key
+  is never passed to the frontend environment.
+- **Local-only exposure** — every service binds to loopback, and the database is
+  addressed through an explicit local namespace.
+- **Error-reporting hygiene** — a failure always surfaces a user-visible error
+  with a bounded log tail, and a warning alone never fails a run.
+
+The navigation policy lives in `scripts/lib/window-policy.js`. It is a separate
+module specifically so this security control can be unit-tested without booting
+Electron.
+
+### Integration tests
+
+These exercise the running stack (API latency under load, and how the app
+behaves when the database dies mid-session). They need services already
+running, so start them in one shell first:
+
+```bash
+node scripts/run-services.js --runtime <path-to>/resources/runtime --data <isolated-data-dir>
+```
+
+Then in a second shell:
+
+```bash
+npm run test:integration
+```
+
+Always point `--data` at an **isolated data directory**, not a real notebook
+data folder — the chaos test intentionally kills the database to verify the
+failure path. Both harnesses exit with code `2` when no API is reachable, so a
+missing runtime skips cleanly instead of reporting a false failure.
+
+### RAG and LLM tests
+
+```bash
+npm run test:rag
+```
+
+With the same stack running, this checks the guarantee that matters most for
+case files: a search or a generated answer scoped to one notebook must never
+return content that was only ever added to another notebook. It seeds two
+notebooks with unique probe tokens, confirms each token is *findable in its own
+notebook* (so the isolation checks cannot pass vacuously), and then asserts
+neither token surfaces through the other notebook's vector or keyword search. A
+chat answer is additionally checked for cross-notebook quotation and for
+citations that carry an identifier a user can verify.
+
+If no probe token can be found even inside its own notebook, the harness refuses
+to report success — an empty result set would make the isolation checks
+meaningless, so it exits `1` as inconclusive instead of passing misleadingly.
+
+Like the other harnesses, it exits `2` when no API is reachable.
+
+---
+
 ## 🩺 Troubleshooting
 
 - **Ports in use** — the app checks 8000, 5055, and 8502 before starting. If any are in use, it shows an error naming the blocked port.
@@ -244,6 +320,7 @@ Office of Equity Open Notebook.exe
 - **"Timed out waiting for Frontend on port 8502" or a blank window** — the bundled Next.js frontend is incomplete. `npm run prepare:runtime`, `package:app`, and `installer` now run `scripts/verify-runtime.js` and fail the build if it is. You can also run `node scripts/verify-runtime.js <path-to>/resources/runtime/frontend` against an existing install. Check `%APPDATA%\Office of Equity Open Notebook\logs\frontend.log` for the underlying error.
 - **No AI responses** — add an API key in Settings, or configure a local model server.
 - **Podcast audio** — some providers may need `ffmpeg` on your PATH.
+- **Database password** — the local SurrealDB instance is no longer left on the well-known `root`/`root` default. A random per-install password is generated into `secrets.json` in the app's user-data folder (readable only by your Windows account). Notebooks created by an older build keep working, because their stored credentials are preserved instead of overwritten.
 
 ---
 

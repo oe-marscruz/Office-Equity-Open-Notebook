@@ -16,7 +16,9 @@
     "package:app": "node scripts/package.js",
     "installer": "node scripts/build-installer.js",
     "verify:installer": "node scripts/verify-installer.js",
-    "test": "node scripts/test/verify-runtime.test.js && node scripts/test/problem-report.test.js && node scripts/test/resolve-runtimes.test.js && node scripts/test/supervisor.test.js"
+    "test": "node scripts/test/verify-runtime.test.js && node scripts/test/problem-report.test.js && node scripts/test/resolve-runtimes.test.js && node scripts/test/encryption-key.test.js && node scripts/test/security.test.js && node scripts/test/supervisor.test.js",
+    "test:integration": "node scripts/test/stress-test.js && node scripts/test/chaos-test.js",
+    "test:rag": "node scripts/test/rag-test.js"
   },
   "devDependencies": {
     "electron": "^33.2.0"

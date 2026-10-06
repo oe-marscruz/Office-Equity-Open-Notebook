@@ -16,6 +16,7 @@ const { ensureEncryptionKey } = require('./scripts/lib/encryption-key');
 const { PRODUCT_NAME, FRONTEND_URL, RUNTIME_DIR } = require('./scripts/lib/paths');
 const { REQUIRED_RUNTIME_FILES } = require('./scripts/lib/runtime-manifest');
 const { createProblemReport } = require('./scripts/lib/problem-report');
+const { isFrontendUrl, isExternalHttpUrl } = require('./scripts/lib/window-policy');
 
 function resolveIconPath() {
   // In development this is the repo root; when packaged, `assets/` is copied
@@ -33,18 +34,57 @@ function resolveRuntimePath() {
 
 let services = null;
 let mainWindow = null;
-let shuttingDown = false;
+let shutdownPromise = null;
+let quitConfirmed = false;
 
-async function stopServices() {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  if (services) {
+// Upper bound on shutdown so a stuck service can never hang the app's exit.
+const SHUTDOWN_TIMEOUT_MS = 15000;
+
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((resolve) => {
+      setTimeout(() => {
+        console.error(`Service shutdown did not finish within ${ms}ms; releasing the app anyway.`);
+        resolve({ survivors: [] });
+      }, ms);
+    }),
+  ]);
+}
+
+/**
+ * Stops the service stack exactly once. Every exit path awaits this same
+ * promise, so a window close and an app quit can no longer race each other
+ * into quitting while services are still running.
+ */
+function stopServices() {
+  if (shutdownPromise) return shutdownPromise;
+  shutdownPromise = (async () => {
+    if (!services) return { survivors: [] };
     try {
-      await services.stop();
+      const result = await services.stop();
+      if (result && result.survivors && result.survivors.length > 0) {
+        console.error(
+          `WARNING: ${result.survivors.length} service process(es) could not be stopped: ` +
+          result.survivors.map((entry) => `${entry.name} (pid ${entry.pid})`).join(', ')
+        );
+      }
+      return result || { survivors: [] };
     } catch (err) {
       console.error('Error stopping services:', err);
+      return { survivors: [] };
     }
-  }
+  })();
+  return shutdownPromise;
+}
+
+/** Runs the shutdown once, then lets the app exit for real. */
+function shutdownAndQuit() {
+  if (quitConfirmed) return;
+  withTimeout(stopServices(), SHUTDOWN_TIMEOUT_MS).finally(() => {
+    quitConfirmed = true;
+    app.quit();
+  });
 }
 
 function dialogRenderer(title) {
@@ -61,7 +101,11 @@ function showErrorAndExit(title, report) {
   // Use a synchronous message box so the app waits for the user to click OK
   // before exiting. dialog.showErrorBox is also synchronous on Windows.
   report.render(dialogRenderer(title));
-  app.exit(report.exitCode());
+  // A partially-started stack must be reaped before we exit, otherwise the
+  // very first failure leaves ports bound and the next launch fails too.
+  withTimeout(stopServices(), SHUTDOWN_TIMEOUT_MS).finally(() => {
+    app.exit(report.exitCode());
+  });
 }
 
 function createWindow() {
@@ -85,16 +129,16 @@ function createWindow() {
 
   // Open external links in the system browser, not inside the app.
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith('http://') || url.startsWith('https://')) {
+    if (isExternalHttpUrl(url)) {
       shell.openExternal(url);
     }
     return { action: 'deny' };
   });
 
   mainWindow.webContents.on('will-navigate', (event, url) => {
-    if (!url.startsWith(FRONTEND_URL)) {
+    if (!isFrontendUrl(url, FRONTEND_URL)) {
       event.preventDefault();
-      if (url.startsWith('http://') || url.startsWith('https://')) {
+      if (isExternalHttpUrl(url)) {
         shell.openExternal(url);
       }
     }
@@ -144,16 +188,14 @@ app.whenReady().then(async () => {
   createWindow();
 });
 
-app.on('window-all-closed', async () => {
-  await stopServices();
-  app.quit();
+app.on('window-all-closed', () => {
+  // Route closing the window through the same guarded path as quitting; the
+  // service stack must be fully reaped before the process goes away.
+  shutdownAndQuit();
 });
 
 app.on('before-quit', (event) => {
-  if (!shuttingDown) {
-    event.preventDefault();
-    stopServices().finally(() => {
-      app.quit();
-    });
-  }
+  if (quitConfirmed) return;
+  event.preventDefault();
+  shutdownAndQuit();
 });
