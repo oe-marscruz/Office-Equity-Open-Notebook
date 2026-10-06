@@ -8,7 +8,7 @@
  * desktop window.
  */
 
-const { app, BrowserWindow, shell, dialog } = require('electron');
+const { app, BrowserWindow, shell, dialog, session } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { startServices } = require('./scripts/start-services');
@@ -122,8 +122,47 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
+      webviewTag: false,
+      navigateOnDragDrop: false,
+      enableBlinkFeatures: '',
     },
   });
+
+  // Content Security Policy: restrict the app to its own origin and block
+  // inline scripts, eval, and remote resources. This prevents XSS from
+  // compromising the renderer even if the frontend has a vulnerability.
+  session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+    callback({
+      responseHeaders: {
+        ...details.responseHeaders,
+        'Content-Security-Policy': [
+          "default-src 'self'; " +
+          "script-src 'self'; " +
+          "style-src 'self' 'unsafe-inline'; " +
+          "img-src 'self' data: blob:; " +
+          "font-src 'self' data:; " +
+          "connect-src 'self' http://127.0.0.1:5055 ws://127.0.0.1:8000; " +
+          "media-src 'self' blob:; " +
+          "object-src 'none'; " +
+          "frame-src 'none'; " +
+          "base-uri 'self'; " +
+          "form-action 'self'",
+        ],
+      },
+    });
+  });
+
+  // Deny all permission requests (geolocation, notifications, camera, etc.).
+  // The app does not need any of these, and denying them reduces the attack
+  // surface if the renderer is compromised.
+  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
+    callback(false);
+  });
+
+  session.defaultSession.setPermissionCheckHandler(() => false);
 
   mainWindow.loadURL(FRONTEND_URL);
 
@@ -150,6 +189,28 @@ function createWindow() {
 }
 
 app.whenReady().then(async () => {
+  // When packaged with ASAR, Electron validates the archive integrity on
+  // startup if `asarIntegrity` is set in package.json. This is a defense
+  // against tampering with the app code. We also verify the ASAR file
+  // exists when packaged.
+  if (app.isPackaged) {
+    const asarPath = path.join(process.resourcesPath, 'app.asar');
+    if (!fs.existsSync(asarPath)) {
+      // Fallback: app may be packaged with loose files (no ASAR).
+      const appDir = path.join(process.resourcesPath, 'app');
+      if (!fs.existsSync(appDir)) {
+        const report = createProblemReport();
+        report.add(
+          'APP_CODE_MISSING',
+          'The application code was not found in the packaged resources. The app may be corrupted.',
+          { detail: `Expected: ${asarPath} or ${appDir}` }
+        );
+        showErrorAndExit(`${PRODUCT_NAME} — app code not found`, report);
+        return;
+      }
+    }
+  }
+
   const runtimePath = resolveRuntimePath();
   const dataDir = app.getPath('userData');
   const encryptionKey = ensureEncryptionKey(dataDir);

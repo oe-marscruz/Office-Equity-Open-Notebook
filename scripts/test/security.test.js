@@ -238,6 +238,141 @@ async function main() {
     assert.strictEqual(report.exitCode(), 0);
   });
 
+  console.log('\nAntivirus / Defender compatibility (no flagged patterns in source)');
+
+  const PROJECT_ROOT = path.join(__dirname, '..', '..');
+
+  function readSource(relPath) {
+    return fs.readFileSync(path.join(PROJECT_ROOT, relPath), 'utf8');
+  }
+
+  /** Strips JS comments (line and block) so tests check actual code, not docs. */
+  function stripComments(src) {
+    return src
+      .replace(/\/\*[\s\S]*?\*\//g, '')   // block comments
+      .replace(/\/\/[^\n]*/g, '');         // line comments
+  }
+
+  await test('no production script uses shell: true for child process spawning', async () => {
+    const scriptsDir = path.join(PROJECT_ROOT, 'scripts');
+    const files = [];
+    function walk(dir) {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        // Skip the test directory — test files legitimately reference patterns
+        if (entry.isDirectory() && entry.name === 'test') continue;
+        if (entry.isDirectory()) walk(full);
+        else if (entry.name.endsWith('.js')) files.push(full);
+      }
+    }
+    walk(scriptsDir);
+    // Also check main.js and preload.js at the project root
+    files.push(path.join(PROJECT_ROOT, 'main.js'));
+    files.push(path.join(PROJECT_ROOT, 'preload.js'));
+    for (const file of files) {
+      const content = stripComments(fs.readFileSync(file, 'utf8'));
+      const matches = content.match(/shell:\s*true/g);
+      assert.strictEqual(matches, null,
+        `${path.relative(PROJECT_ROOT, file)} uses shell: true — this triggers antivirus flags`);
+    }
+  });
+
+  await test('the installer does not request admin execution level', async () => {
+    const installer = stripComments(readSource(path.join('scripts', 'build-installer.js')));
+    assert.strictEqual(installer.includes('RequestExecutionLevel admin'), false,
+      'RequestExecutionLevel admin triggers Defender SmartScreen warnings');
+    assert.ok(installer.includes('RequestExecutionLevel user'),
+      'installer should use RequestExecutionLevel user');
+  });
+
+  await test('the installer does not write to HKLM in the NSIS script', async () => {
+    const installer = stripComments(readSource(path.join('scripts', 'build-installer.js')));
+    // HKLM should not appear in actual NSIS WriteRegStr commands
+    const hklmWrites = installer.match(/WriteRegStr\s+HKLM/g);
+    assert.strictEqual(hklmWrites, null,
+      'HKLM registry writes require admin and trigger Defender flags');
+  });
+
+  await test('the installer does not use fixed system paths for staging', async () => {
+    const installer = stripComments(readSource(path.join('scripts', 'build-installer.js')));
+    // C:\onb should not appear as an actual path assignment (only in comments)
+    const fixedPath = installer.match(/["']C:\\onb["']/g);
+    assert.strictEqual(fixedPath, null,
+      'fixed path C:\\onb triggers Defender flags for writing to system root');
+  });
+
+  await test('the supervisor does not use tasklist for process checks', async () => {
+    const supervisor = stripComments(readSource(path.join('scripts', 'lib', 'supervisor.js')));
+    // tasklist should not be spawned (process.kill(pid, 0) is used instead)
+    const tasklistSpawn = supervisor.match(/spawn(Sync)?\(\s*['"]tasklist['"]/g);
+    assert.strictEqual(tasklistSpawn, null,
+      'tasklist triggers Defender process-enumeration flags; use process.kill(pid, 0) instead');
+  });
+
+  await test('the supervisor uses process.kill for liveness checks', async () => {
+    const supervisor = stripComments(readSource(path.join('scripts', 'lib', 'supervisor.js')));
+    assert.ok(supervisor.includes('process.kill(pid, 0)'),
+      'isProcessAlive should use process.kill(pid, 0) instead of tasklist');
+  });
+
+  await test('main.js enables the Electron sandbox', async () => {
+    const main = stripComments(readSource('main.js'));
+    assert.ok(main.includes('sandbox: true'), 'Electron sandbox must be enabled');
+    assert.ok(main.includes('webSecurity: true'), 'webSecurity must be enabled');
+    assert.ok(main.includes('contextIsolation: true'), 'contextIsolation must be enabled');
+  });
+
+  await test('main.js applies a Content Security Policy', async () => {
+    const main = stripComments(readSource('main.js'));
+    assert.ok(main.includes('onHeadersReceived'), 'CSP must be applied via onHeadersReceived');
+    assert.ok(main.includes('Content-Security-Policy'), 'CSP header must be set');
+  });
+
+  await test('main.js denies all browser permissions', async () => {
+    const main = stripComments(readSource('main.js'));
+    assert.ok(main.includes('setPermissionRequestHandler'), 'permission request handler must be set');
+    assert.ok(main.includes('setPermissionCheckHandler'), 'permission check handler must be set');
+  });
+
+  await test('the encryption key is not stored in plaintext', async () => {
+    const encKey = stripComments(readSource(path.join('scripts', 'lib', 'encryption-key.js')));
+    assert.ok(encKey.includes('deriveObfuscationKey'),
+      'encryption key must be obfuscated with a machine-bound derivation');
+    assert.ok(encKey.includes('xorObfuscate'),
+      'encryption key must be XOR-obfuscated before writing to disk');
+  });
+
+  await test('downloaded binaries are verified with Authenticode signatures', async () => {
+    const prep = stripComments(readSource(path.join('scripts', 'prepare-runtime.js')));
+    assert.ok(prep.includes('verifyAuthenticodeSignature'),
+      'downloaded executables must be verified with Authenticode signatures');
+    assert.ok(prep.includes('Get-AuthenticodeSignature'),
+      'Authenticode verification must use Get-AuthenticodeSignature');
+  });
+
+  await test('all spawn calls use windowsHide on Windows', async () => {
+    const cli = stripComments(readSource(path.join('scripts', 'lib', 'cli.js')));
+    const spawnCalls = cli.match(/spawn(Sync)?\(/g) || [];
+    assert.ok(spawnCalls.length > 0, 'cli.js should have spawn calls');
+    assert.ok(cli.includes('windowsHide: true'),
+      'spawn calls should include windowsHide: true to prevent console window flashing');
+  });
+
+  await test('the encryption key file round-trips through obfuscation', async () => {
+    const dataDir = makeTempDir('onb-sec-obf-');
+    const key = ensureEncryptionKey(dataDir);
+    const keyFile = path.join(dataDir, KEY_FILENAME);
+    const rawContent = fs.readFileSync(keyFile, 'utf8');
+    // The raw key must not appear in the file
+    assert.strictEqual(rawContent.includes(key), false,
+      'the raw encryption key must not appear in plaintext in the key file');
+    // But reading it back must return the same key
+    const { readEncryptionKeyFile } = require('../lib/encryption-key');
+    // readEncryptionKeyFile is not exported; test via ensureEncryptionKey idempotency
+    const keyAgain = ensureEncryptionKey(dataDir);
+    assert.strictEqual(keyAgain, key, 'ensureEncryptionKey must return the same key on subsequent calls');
+  });
+
   fixtures.forEach((directory) => fs.rmSync(directory, { recursive: true, force: true }));
   console.log(`\n${passed} security tests passed${failed ? `, ${failed} failed` : ''}`);
   if (failed > 0) process.exitCode = 1;

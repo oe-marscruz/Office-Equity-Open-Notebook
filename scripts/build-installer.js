@@ -62,9 +62,11 @@ function main() {
     return;
   }
 
-  // Use a unique short-root staging directory per run. This avoids MAX_PATH
-  // and guarantees we never clobber user data in a fixed path like C:\onb.
-  const shortRoot = path.join('C:\\onb', `build-${process.pid}-${Date.now()}`);
+  // Use a unique short-root staging directory per run under the system temp
+  // directory. This avoids MAX_PATH, guarantees we never clobber user data,
+  // and avoids writing to a fixed root path (C:\onb) which antivirus software
+  // flags as suspicious behavior.
+  const shortRoot = path.join(require('os').tmpdir(), `onb-build-${process.pid}-${Date.now()}`);
   const shortAppRequired = path.join(shortRoot, 'OpenNotebook-required');
   const shortAppPython = path.join(shortRoot, 'OpenNotebook-python');
   const shortAppNode = path.join(shortRoot, 'OpenNotebook-node');
@@ -84,7 +86,7 @@ function main() {
     } catch (err) {
       throw new Error(
         `Cannot create staging directory ${shortRoot}: ${err.message}. ` +
-          'The installer build writes to C:\\onb to stay under MAX_PATH; grant write access to that path.'
+          'The installer build stages files in the system temp directory to stay under MAX_PATH.'
       );
     }
 
@@ -116,13 +118,17 @@ function main() {
     const iconDefines = fs.existsSync(iconPath)
       ? `!define MUI_ICON "${iconPath.replace(/\\/g, '/')}"\n!define MUI_UNICON "${iconPath.replace(/\\/g, '/')}"`
       : '';
+    // Per-user installation: no admin rights required, installs to
+    // %LOCALAPPDATA% instead of Program Files. This avoids the UAC prompt
+    // that triggers antivirus scrutiny and SmartScreen warnings.
+    // Registry writes go to HKCU (current user) instead of HKLM (machine-wide).
     const script = `
 !include "MUI2.nsh"
 Name "${PRODUCT_NAME}"
 OutFile "${nsisInstallerPath}"
-InstallDir "$PROGRAMFILES64\\${PRODUCT_NAME}"
-InstallDirRegKey HKLM "Software\\${PRODUCT_NAME}" "InstallDir"
-RequestExecutionLevel admin
+InstallDir "$LOCALAPPDATA\\${PRODUCT_NAME}"
+InstallDirRegKey HKCU "Software\\${PRODUCT_NAME}" "InstallDir"
+RequestExecutionLevel user
 Unicode true
 CRCCheck on
 !define MUI_ABORTWARNING
@@ -141,14 +147,14 @@ Section "${PRODUCT_NAME} (required)" SecApp
   SetOutPath "$INSTDIR"
   File /r "OpenNotebook-required\\*"
   WriteUninstaller "$INSTDIR\\Uninstall.exe"
-  WriteRegStr HKLM "Software\\${PRODUCT_NAME}" "InstallDir" "$INSTDIR"
-  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\${PRODUCT_NAME}" "DisplayName" "${PRODUCT_NAME}"
-  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\${PRODUCT_NAME}" "DisplayVersion" "${VERSION}"
-  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\${PRODUCT_NAME}" "Publisher" "${PRODUCT_NAME} Desktop"
-  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\${PRODUCT_NAME}" "UninstallString" '"$INSTDIR\\Uninstall.exe"'
-  WriteRegStr HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\${PRODUCT_NAME}" "InstallLocation" "$INSTDIR"
-  WriteRegDWORD HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\${PRODUCT_NAME}" "NoModify" 1
-  WriteRegDWORD HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\${PRODUCT_NAME}" "NoRepair" 1
+  WriteRegStr HKCU "Software\\${PRODUCT_NAME}" "InstallDir" "$INSTDIR"
+  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\${PRODUCT_NAME}" "DisplayName" "${PRODUCT_NAME}"
+  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\${PRODUCT_NAME}" "DisplayVersion" "${VERSION}"
+  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\${PRODUCT_NAME}" "Publisher" "${PRODUCT_NAME} Desktop"
+  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\${PRODUCT_NAME}" "UninstallString" '"$INSTDIR\\Uninstall.exe"'
+  WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\${PRODUCT_NAME}" "InstallLocation" "$INSTDIR"
+  WriteRegDWORD HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\${PRODUCT_NAME}" "NoModify" 1
+  WriteRegDWORD HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\${PRODUCT_NAME}" "NoRepair" 1
   CreateDirectory "$SMPROGRAMS\\${PRODUCT_NAME}"
   CreateShortcut "$SMPROGRAMS\\${PRODUCT_NAME}\\${PRODUCT_NAME}.lnk" "$INSTDIR\\${PRODUCT_NAME}.exe"
   CreateShortcut "$DESKTOP\\${PRODUCT_NAME}.lnk" "$INSTDIR\\${PRODUCT_NAME}.exe"
@@ -170,8 +176,8 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\\${PRODUCT_NAME}\\${PRODUCT_NAME}.lnk"
   RMDir "$SMPROGRAMS\\${PRODUCT_NAME}"
   Delete "$DESKTOP\\${PRODUCT_NAME}.lnk"
-  DeleteRegKey HKLM "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\${PRODUCT_NAME}"
-  DeleteRegKey HKLM "Software\\${PRODUCT_NAME}"
+  DeleteRegKey HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\${PRODUCT_NAME}"
+  DeleteRegKey HKCU "Software\\${PRODUCT_NAME}"
 SectionEnd
 `;
 
