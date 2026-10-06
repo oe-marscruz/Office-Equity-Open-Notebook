@@ -7,7 +7,7 @@ const os = require('os');
 const path = require('path');
 const { resolveInterpreter } = require('../lib/resolve-runtimes');
 const { buildBackendEnv, serviceTable } = require('../lib/service-table');
-const { supervise, isPortOpen, waitForPort } = require('../lib/supervisor');
+const { supervise, isPortOpen, waitForPort, isProcessAlive, killProcessTree } = require('../lib/supervisor');
 
 const fixtures = [];
 let passed = 0;
@@ -74,6 +74,9 @@ async function main() {
     assert.strictEqual(backendEnv.TIKTOKEN_CACHE_DIR, path.join(runtimePath, 'tiktoken-cache'));
     assert.strictEqual(backendEnv.PYTHONPATH, backendPath);
     assert.strictEqual(backendEnv.KEEP, 'inherited');
+    assert.strictEqual(backendEnv.SURREAL_USER, 'root');
+    assert.strictEqual(backendEnv.SURREAL_PASSWORD, 'root');
+    assert.deepStrictEqual(table[0].args.slice(3, 7), ['--user', 'root', '--pass', 'root']);
     assert.strictEqual(table[2].readyPort, null);
     assert.deepStrictEqual(table[3].env, {
       ...env,
@@ -82,6 +85,35 @@ async function main() {
       HOSTNAME: '127.0.0.1',
       INTERNAL_API_URL: 'http://127.0.0.1:5055',
     });
+  });
+
+  await test('a generated database password reaches both the env and the surreal arguments', () => {
+    const runtimePath = path.join(os.tmpdir(), 'service-fixture');
+    const dataDir = path.join(os.tmpdir(), 'service-data');
+    const backendPath = path.join(runtimePath, 'backend');
+    const env = { PATH: 'test-path' };
+    const surrealPassword = 'generated-secret-value';
+    const backendEnv = buildBackendEnv({
+      dataDir,
+      encryptionKey: 'test-key',
+      tiktokenCache: path.join(runtimePath, 'tiktoken-cache'),
+      backendPath,
+      env,
+      surrealPassword,
+    });
+    const table = serviceTable({
+      runtimePath,
+      dataDir,
+      backendPath,
+      pythonExe: path.join(runtimePath, 'python', 'python.exe'),
+      nodeExe: path.join(runtimePath, 'node', 'node.exe'),
+      env,
+      backendEnv,
+      surrealPassword,
+    });
+
+    assert.strictEqual(backendEnv.SURREAL_PASSWORD, surrealPassword);
+    assert.deepStrictEqual(table[0].args.slice(3, 7), ['--user', 'root', '--pass', surrealPassword]);
   });
 
   await test('waitForPort resolves when a real listener is available', async () => {
@@ -195,9 +227,90 @@ async function main() {
     if (child.exitCode === null && child.signalCode === null) {
       await Promise.race([childClosed, new Promise((resolve) => setTimeout(resolve, 5000))]);
     }
-    assert.ok(child.killed, 'service child should be terminated after stop');
+    // Assert the outcome (the process is actually gone) rather than the
+    // mechanism, since shutdown now terminates the whole process tree.
     assert.ok(child.signalCode !== null || child.exitCode !== null, 'service child should finish after stop');
+    assert.strictEqual(isProcessAlive(child.pid), false, 'service child should be terminated after stop');
     assert.strictEqual(await isPortOpen(port), false);
+  });
+
+  await test('isProcessAlive reports live and exited processes accurately', async () => {
+    const child = require('child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], {
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      assert.strictEqual(isProcessAlive(child.pid), true, 'running child should report alive');
+      assert.strictEqual(isProcessAlive(0), false, 'invalid pid should report not alive');
+      assert.strictEqual(isProcessAlive(2147483600), false);
+    } finally {
+      killProcessTree(child.pid, { force: true });
+    }
+    const exited = await new Promise((resolve) => child.once('exit', () => resolve(true)));
+    assert.strictEqual(exited, true);
+  });
+
+  await test('stop() returns no survivors for a healthy shutdown', async () => {
+    const logsDir = makeTempDir('onb-supervisor-survivor-');
+    const result = await supervise([{
+      name: 'daemon',
+      cmd: process.execPath,
+      args: ['-e', 'setTimeout(() => {}, 30000)'],
+      cwd: logsDir,
+      env: process.env,
+      readyPort: null,
+      critical: true,
+      settleMs: 300,
+    }], { logsDir });
+
+    const outcome = await result.stop();
+    assert.ok(Array.isArray(outcome.survivors), 'stop should report a survivors list');
+    assert.deepStrictEqual(outcome.survivors, []);
+    assert.strictEqual(isProcessAlive(result.children[0].pid), false, 'service tree should be gone');
+  });
+
+  await test('stop() is idempotent and safe to call concurrently', async () => {
+    const logsDir = makeTempDir('onb-supervisor-idempotent-');
+    const probe = net.createServer();
+    const port = await listen(probe);
+    await close(probe);
+    const result = await supervise([{
+      name: 'smoke-idem',
+      cmd: process.execPath,
+      args: ['-e', `require('net').createServer().listen(${port}, '127.0.0.1')`],
+      cwd: logsDir,
+      env: process.env,
+      readyPort: port,
+      timeoutMs: 5000,
+      critical: true,
+    }], { logsDir });
+
+    const [first, second] = await Promise.all([result.stop(), result.stop()]);
+    assert.deepStrictEqual(first.survivors, []);
+    assert.deepStrictEqual(second.survivors, []);
+    assert.strictEqual(await isPortOpen(port), false);
+  });
+
+  await test('supervise rejects when a critical portless service dies during startup', async () => {
+    const logsDir = makeTempDir('onb-supervisor-worker-die-');
+    await assert.rejects(
+      supervise([{
+        name: 'dies-immediately',
+        cmd: process.execPath,
+        args: ['-e', 'console.log("worker booted"); process.exit(0)'],
+        cwd: logsDir,
+        env: process.env,
+        readyPort: null,
+        critical: true,
+        settleMs: 2000,
+      }], { logsDir }),
+      (error) => {
+        assert.match(error.message, /dies-immediately exited with code 0/);
+        assert.match(error.message, /Recent log output:[\s\S]*worker booted/);
+        return true;
+      }
+    );
   });
 
   fixtures.forEach((directory) => fs.rmSync(directory, { recursive: true, force: true }));

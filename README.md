@@ -237,6 +237,41 @@ Office of Equity Open Notebook.exe
 
 ---
 
+## 🧪 Testing
+
+### Unit tests
+
+```bash
+npm test
+```
+
+Covers the desktop wrapper layer only — runtime verification, problem reporting,
+interpreter resolution, credential handling, and the service supervisor. No
+assembled runtime is required, so this runs on any machine and in CI.
+
+### Integration tests
+
+These exercise the running stack (API latency under load, and how the app
+behaves when the database dies mid-session). They need services already
+running, so start them in one shell first:
+
+```bash
+node scripts/run-services.js --runtime <path-to>/resources/runtime --data <isolated-data-dir>
+```
+
+Then in a second shell:
+
+```bash
+npm run test:integration
+```
+
+Always point `--data` at an **isolated data directory**, not a real notebook
+data folder — the chaos test intentionally kills the database to verify the
+failure path. Both harnesses exit with code `2` when no API is reachable, so a
+missing runtime skips cleanly instead of reporting a false failure.
+
+---
+
 ## 🩺 Troubleshooting
 
 - **Ports in use** — the app checks 8000, 5055, and 8502 before starting. If any are in use, it shows an error naming the blocked port.
@@ -244,6 +279,7 @@ Office of Equity Open Notebook.exe
 - **"Timed out waiting for Frontend on port 8502" or a blank window** — the bundled Next.js frontend is incomplete. `npm run prepare:runtime`, `package:app`, and `installer` now run `scripts/verify-runtime.js` and fail the build if it is. You can also run `node scripts/verify-runtime.js <path-to>/resources/runtime/frontend` against an existing install. Check `%APPDATA%\Office of Equity Open Notebook\logs\frontend.log` for the underlying error.
 - **No AI responses** — add an API key in Settings, or configure a local model server.
 - **Podcast audio** — some providers may need `ffmpeg` on your PATH.
+- **Database password** — the local SurrealDB instance is no longer left on the well-known `root`/`root` default. A random per-install password is generated into `secrets.json` in the app's user-data folder (readable only by your Windows account). Notebooks created by an older build keep working, because their stored credentials are preserved instead of overwritten.
 
 ---
 
