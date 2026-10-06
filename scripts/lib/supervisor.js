@@ -339,13 +339,18 @@ async function supervise(table, options = {}) {
         if (pending.length) await sleep(EXIT_POLL_MS);
       }
 
-      for (const stream of logStreams.values()) {
+      // Close log streams and wait for the file handles to release so
+      // callers can delete the log directory on Windows without EPERM.
+      await Promise.all([...logStreams.values()].map((stream) => new Promise((resolve) => {
+        if (stream.destroyed || stream.closed) return resolve();
+        stream.once('close', resolve);
+        stream.once('error', resolve);
         try {
           stream.end();
         } catch (_) {
-          // Best-effort stream cleanup.
+          resolve();
         }
-      }
+      })));
 
       // Never claim success we did not observe: leftover processes hold ports
       // and the SurrealDB file lock, which breaks the next launch.
