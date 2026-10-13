@@ -4,6 +4,18 @@
 
 const fs = require('fs');
 const path = require('path');
+const { execSync } = require('child_process');
+
+const distPath = path.join(__dirname, '../../dist/src/contracts/performance-harness.js');
+const tscPath = path.join(__dirname, '../../node_modules/typescript/bin/tsc');
+
+// 1. Auto-compile if missing (Bypasses npx/npm completely)
+if (!fs.existsSync(distPath)) {
+  console.log('Compiling TypeScript files natively using Node...');
+  execSync(`node "${tscPath}"`, { stdio: 'inherit', cwd: path.join(__dirname, '../../') });
+}
+
+// 2. Safe to require now
 const {
   collectHostEnvironment,
   getDirectorySizeBytes,

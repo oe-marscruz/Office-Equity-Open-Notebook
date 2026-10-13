@@ -1,0 +1,42 @@
+{
+  "packet": "baseline",
+  "timestamp": "2024-01-01T00:00:00Z",
+  "host": "test-runner",
+  "environment": {
+    "os": "Windows_NT",
+    "nodeVersion": "v22.23.3",
+    "electronVersion": "33.2.0",
+    "pythonVersion": "3.12.0",
+    "surrealDbVersion": "2.6.5",
+    "cpuModel": "AMD EPYC 9V45",
+    "totalMemoryBytes": 16000000000
+  },
+  "artifactSizes": {
+    "installerBytes": 100000000,
+    "installedBytes": 200000000,
+    "runtimeDirectoryBytes": 50000000,
+    "electronBytes": 80000000,
+    "nodeRuntimeBytes": 20000000,
+    "pythonRuntimeBytes": 30000000,
+    "pythonSitePackagesBytes": 10000000,
+    "doclingBytes": 5000000,
+    "surrealDbBytes": 5000000
+  },
+  "runtimeMetrics": {
+    "idleProcessCount": 1,
+    "idlePrivateWorkingSetRssBytes": 50000000,
+    "idleTotalWorkingSetBytes": 60000000,
+    "idleCpuPercent": 1.0,
+    "coldStartToWindowMs": 500,
+    "coldStartToApiReadyMs": 600,
+    "coldStartToUsableUiMs": 700,
+    "cleanShutdownDurationMs": 100,
+    "restartAfterCrashSuccess": true
+  },
+  "workloadMetrics": {
+    "peakMemoryPdfIngestBytes": 200000000,
+    "peakMemoryOcrIngestBytes": 300000000,
+    "searchLatencyP95Ms": 50,
+    "ragResponseLatencyP95Ms": 1000
+  }
+}

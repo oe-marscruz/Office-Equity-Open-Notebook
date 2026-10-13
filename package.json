@@ -15,7 +15,7 @@
     "package:app": "node scripts/package-native.js",
     "installer": "node scripts/build-installer-native.js",
     "typecheck": "tsc --noEmit",
-    "build:types": "rm -rf dist && tsc",
+    "build:types": "node scripts/build-types.js",
     "start:electron": "electron .",
     "package:electron": "node scripts/package.js",
     "installer:electron": "node scripts/build-installer.js"
