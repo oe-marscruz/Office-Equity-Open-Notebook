@@ -29,7 +29,7 @@ fn test_compatibility_scenarios() {
                 let services = case["input"].as_array().unwrap();
                 let mut reversed = services.clone();
                 reversed.reverse();
-                assert_eq!(reversed, case["expectedOutput"].as_array().unwrap());
+                assert_eq!(&reversed, case["expectedOutput"].as_array().unwrap());
             },
             _ => {}
         }

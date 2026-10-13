@@ -8,6 +8,8 @@ resources/.cache/
 # Build output
 dist/
 release/
+out/
+src-tauri/target/
 
 # Test data
 resources/.testdata/

@@ -224,7 +224,7 @@ function buildPython(repo, options = {}) {
     // installed content-core version so its transitive deps stay compatible
     // with the locked base install.
     const ccoreVersion = runCapture(
-      path.join(dest, 'python', 'python.exe'),
+      path.join(dest, 'python.exe'),
       ['-c', "import importlib.metadata as m; print(m.version('content-core'))"],
       { env: { ...process.env, PYTHONPATH: path.join(buildDir, 'site-packages') } }
     );
