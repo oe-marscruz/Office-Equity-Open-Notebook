@@ -3,7 +3,7 @@ use std::fs;
 use std::time::Duration;
 use tokio::time::sleep;
 use std::net::TcpStream;
-use sysinfo::{System, SystemExt, ProcessExt};
+use sysinfo::{System, SystemExt};
 use serde_json::Value;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -137,9 +137,9 @@ fn spawn_service(name: &'static str, mut cmd: tokio::process::Command, logs_dir:
 
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::io::AsRawHandle;
-        let handle = child.as_raw_handle() as winapi::um::winnt::HANDLE;
-        let _ = crate::job_object::apply_job_object_to_process(handle);
+        if let Some(handle) = child.raw_handle() {
+            let _ = crate::job_object::apply_job_object_to_process(handle as winapi::um::winnt::HANDLE);
+        }
     }
 
     let stdout = child.stdout.take().unwrap();

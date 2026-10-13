@@ -10,7 +10,6 @@ mod proxy;
 mod static_server;
 mod server;
 
-use tauri::Manager;
 use runner::{resolve_runtime_path, check_missing_files, start_services};
 
 fn main() {
@@ -25,10 +24,13 @@ fn main() {
         std::process::exit(1);
     }
 
+    // The window is created in `setup` so the navigation policy is installed before the
+    // webview loads. Clear the config-declared windows so `tauri` does not also create one.
+    let mut context = tauri::generate_context!();
+    let window_config = context.config_mut().tauri.windows.pop();
+
     tauri::Builder::default()
         .setup(move |app| {
-            let handle = app.handle();
-
             // Start background services and embedded static/proxy server
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = start_services(runtime_path.clone()).await {
@@ -41,13 +43,12 @@ fn main() {
                 }
             });
 
-            // Apply navigation security policy to the main window
-            if let Some(main_window) = handle.get_window("main") {
-                security::apply_navigation_policy(&main_window);
-            }
+            // Create the main window with the navigation security policy applied
+            let config = window_config.clone().unwrap_or_default();
+            security::build_secured_window(app, config)?;
 
             Ok(())
         })
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running tauri application");
 }

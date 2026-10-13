@@ -8,13 +8,13 @@ on:
 
 jobs:
   ci-pipeline:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '22.x'
           cache: 'npm'
@@ -64,10 +64,10 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '22.x'
           cache: 'npm'
@@ -78,23 +78,106 @@ jobs:
       - name: Install Rust (Tauri Dependency)
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v10.3.0
+
+      - name: Verify Toolchain
+        shell: pwsh
+        run: |
+          node --version
+          python --version
+          uv --version
+
+      - name: Checkout Upstream Source (lfnovo/open-notebook)
+        uses: actions/checkout@v5
+        with:
+          repository: lfnovo/open-notebook
+          ref: a0f6f3081ae06328f0a451b3a3ef2959ca25721d
+          path: open-notebook
+
+      - name: Validate Upstream Checkout
+        shell: pwsh
+        run: |
+          $pyproject = Join-Path "${{ github.workspace }}" "open-notebook/pyproject.toml"
+          if (-not (Test-Path -LiteralPath $pyproject -PathType Leaf)) {
+            Write-Error "Upstream checkout is incomplete: pyproject.toml not found at $pyproject"
+            exit 1
+          }
+          Write-Host "Found upstream pyproject.toml at $pyproject"
+
+      - name: Verify Upstream Commit Matches Lock File
+        shell: pwsh
+        run: |
+          $expected = (Get-Content -LiteralPath "upstream.lock.json" -Raw | ConvertFrom-Json).commit
+          $actual = (git -C "${{ github.workspace }}/open-notebook" rev-parse HEAD).Trim()
+          if ($actual -ne $expected) {
+            Write-Error "Upstream commit mismatch: upstream.lock.json=$expected, checkout=$actual"
+            exit 1
+          }
+          Write-Host "Verified upstream commit: $actual"
+
       - name: Install NSIS
-        run: choco install nsis
+        shell: pwsh
+        run: |
+          choco install nsis -y --no-progress
+          $candidates = @(
+            "C:\Program Files (x86)\NSIS\makensis.exe",
+            "C:\Program Files\NSIS\makensis.exe"
+          )
+          $makensis = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          if (-not $makensis) {
+            $resolved = Get-Command makensis.exe -ErrorAction SilentlyContinue
+            if ($resolved) { $makensis = $resolved.Source }
+          }
+          if (-not $makensis) {
+            Write-Error "makensis.exe could not be located after installing NSIS"
+            exit 1
+          }
+          Write-Host "Resolved makensis: $makensis"
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "MAKENSIS=$makensis"
 
       - name: Build Types
         run: npm run build:types
 
       - name: Prepare Runtime
-        run: node scripts/prepare-runtime.js --override-upstream-check
+        run: node scripts/prepare-runtime.js --repo="${{ github.workspace }}/open-notebook"
 
-      - name: Package App
-        run: node scripts/package.js
+      - name: Package App (Native Tauri)
+        run: npm run package:app
 
       - name: Build Native Installer
-        run: node scripts/build-installer.js
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath $env:MAKENSIS -PathType Leaf)) {
+            Write-Error "makensis.exe not found at $env:MAKENSIS"
+            exit 1
+          }
+          node scripts/build-installer-native.js --makensis "$env:MAKENSIS"
+
+      - name: Verify Installer Artifact
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem -LiteralPath "dist" -Filter *.exe -File -ErrorAction SilentlyContinue)
+          if ($installers.Count -eq 0) {
+            Write-Error "No installer .exe was produced in dist/"
+            exit 1
+          }
+          foreach ($installer in $installers) {
+            if ($installer.Length -le 0) {
+              Write-Error "Installer is empty: $($installer.FullName)"
+              exit 1
+            }
+            Write-Host "Installer verified: $($installer.FullName) ($($installer.Length) bytes)"
+          }
 
       - name: Upload Installer Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: Office-Equity-Open-Notebook-Installer
           path: dist/*.exe
+          if-no-files-found: error
