@@ -58,3 +58,43 @@ jobs:
 
       - name: Run Master Mechanical Verifier
         run: node scripts/orchestrator/verifier.js
+
+  build-installer:
+    needs: ci-pipeline
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Install Rust (Tauri Dependency)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install NSIS
+        run: choco install nsis
+
+      - name: Build Types
+        run: npm run build:types
+
+      - name: Prepare Runtime
+        run: node scripts/prepare-runtime.js --override-upstream-check
+
+      - name: Package App
+        run: node scripts/package.js
+
+      - name: Build Native Installer
+        run: node scripts/build-installer.js
+
+      - name: Upload Installer Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Office-Equity-Open-Notebook-Installer
+          path: dist/*.exe
