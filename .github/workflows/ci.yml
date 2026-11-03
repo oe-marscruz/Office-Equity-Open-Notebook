@@ -27,6 +27,7 @@ jobs:
           npm run build:types
           node scripts/tests/test-service-contracts.js
           node scripts/tests/test-readiness.js
+          node scripts/tests/test-credentials.js
 
       - name: Lane 2 - Integration Lane (API Proxy & Loopback Audit)
         run: |

@@ -16,6 +16,7 @@
     "installer": "node scripts/build-installer-native.js",
     "typecheck": "tsc --noEmit",
     "build:types": "node scripts/build-types.js",
+    "test": "node scripts/orchestrator/verifier.js",
     "start:electron": "electron .",
     "package:electron": "node scripts/package.js",
     "installer:electron": "node scripts/build-installer.js"
