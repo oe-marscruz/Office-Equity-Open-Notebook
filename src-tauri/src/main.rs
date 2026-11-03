@@ -4,6 +4,7 @@
 )]
 
 mod runner;
+mod service_diagnostics;
 mod security;
 mod job_object;
 mod proxy;
@@ -15,7 +16,7 @@ use runner::{resolve_runtime_path, check_missing_files, start_services};
 fn main() {
     let runtime_path = resolve_runtime_path();
     if let Err(missing) = check_missing_files(&runtime_path) {
-        let msg = format!("The bundled runtime is incomplete. Please re-run `npm run prepare:runtime` and rebuild the app.\n\nMissing:\n{:#?}", missing);
+        let msg = format!("The bundled runtime is incomplete. Please re-run `npm run prepare:runtime` and rebuild the app. Missing components: {}.", missing.len());
         eprintln!("Office of Equity Open Notebook — runtime not found");
         eprintln!("{}", msg);
         tauri::api::dialog::blocking::MessageDialogBuilder::new("Office of Equity Open Notebook — runtime not found", &msg)
@@ -33,8 +34,8 @@ fn main() {
         .setup(move |app| {
             // Start background services and embedded static/proxy server
             tauri::async_runtime::spawn(async move {
-                if let Err(e) = start_services(runtime_path.clone()).await {
-                    let msg = format!("CRITICAL: Failed to start services:\n\n{}", e);
+                if start_services(runtime_path.clone()).await.is_err() {
+                    let msg = "SERVICE_STARTUP_FAILED: Review the service lifecycle diagnostics.".to_owned();
                     eprintln!("{}", msg);
                     tauri::api::dialog::blocking::MessageDialogBuilder::new("Office of Equity Open Notebook — failed to start", &msg)
                         .kind(tauri::api::dialog::MessageDialogKind::Error)
@@ -49,6 +50,9 @@ fn main() {
 
             Ok(())
         })
-        .run(context)
-        .expect("error while running tauri application");
+.run(context)
+        .unwrap_or_else(|_| {
+            eprintln!("NATIVE_HOST_FAILED");
+            std::process::exit(1);
+        });
 }

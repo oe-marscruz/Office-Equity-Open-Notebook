@@ -1,11 +1,30 @@
+'use strict';
+
+const assert = require('node:assert/strict');
+const http = require('node:http');
 const { isHttpReady } = require('../start-services');
 
-async function testHttpReady() {
-  const isReady = await isHttpReady('http://127.0.0.1:0/not-a-port', 50);
-  console.log('isReady expected false: ', isReady === false);
-  if (isReady !== false) {
-    process.exit(1);
+async function run() {
+  const server = http.createServer((req, res) => {
+    res.writeHead(req.url === '/ready' ? 200 : 503);
+    res.end();
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const url = `http://127.0.0.1:${server.address().port}`;
+  try {
+    assert.equal(await isHttpReady(`${url}/ready`), true);
+    assert.equal(await isHttpReady(`${url}/unavailable`), false);
+  } finally {
+    await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
   }
+  assert.equal(await isHttpReady(`${url}/ready`), false);
+  console.log('Readiness: HTTP success, failure, and connection refusal passed.');
 }
 
-testHttpReady().then(() => console.log('Done'));
+run().catch(err => {
+  console.error(err);
+  process.exitCode = 1;
+});

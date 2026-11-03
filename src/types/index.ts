@@ -1291,6 +1291,10 @@ export interface VulnerabilityTriageItem {
 
 export interface SecurityComplianceAuditReport {
   packetId: 'L8.2';
+  evidenceKind: 'synthetic-contract-fixtures';
+  productionControlsVerified: false;
+  vulnerabilityScanPerformed: false;
+  limitations: readonly string[];
   title: string;
   timestamp: string;
   secretTraceAudits: readonly SecretTraceCheck[];
@@ -1300,7 +1304,8 @@ export interface SecurityComplianceAuditReport {
   vulnerabilityTriage: readonly VulnerabilityTriageItem[];
   findings: readonly SecurityFinding[];
   verdict: {
-    fullyCompliant: boolean;
+    fullyCompliant: false;
+    fixtureChecksPassed: boolean;
     summary: string;
   };
 }
