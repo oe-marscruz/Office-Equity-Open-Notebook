@@ -81,11 +81,18 @@ async function electronErrors(mode) {
   const fakeFs={existsSync:file=>mode!=='missing' || file.endsWith('encryption-key.txt'),readFileSync:()=>{
     if(mode==='key-error')throw Error('SYNTHETIC_EXCEPTION');return 'synthetic key';
   }};
-  const dependencies={electron:{app,BrowserWindow:Window,shell:{},dialog:{showErrorBox:(...values)=>messages.push(...values)}},path,fs:fakeFs,crypto:require('node:crypto'),
+  const dependencies={electron:{app,BrowserWindow:Window,shell:{},dialog:{showErrorBox:(...values)=>messages.push(...values)}},path,fs:fakeFs,
     './scripts/start-services':{startServices:async()=>{
       if(mode==='startup')throw Error('SYNTHETIC_EXCEPTION');
       return {stop:async()=>{throw Error('SYNTHETIC_EXCEPTION');}};
-    }}};
+    }},
+    './scripts/lib/credentials':{
+      ensureEncryptionKey:()=>{
+        if(mode==='key-error')throw Error('SYNTHETIC_EXCEPTION');
+        return 'synthetic key';
+      },
+      resolveDatabaseCredentials:()=>({user:'root',password:'synthetic',legacy:true,source:'legacy'}),
+    }};
   vm.runInNewContext(fs.readFileSync(path.join(root,'main.js'),'utf8'),{
     require:name=>{assert.ok(Object.hasOwn(dependencies,name));return dependencies[name];},
     __dirname:path.join(temporary,'SYNTHETIC_PATH'),console:{error:(...values)=>messages.push(...values)},

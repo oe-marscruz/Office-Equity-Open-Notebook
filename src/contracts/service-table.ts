@@ -22,7 +22,10 @@ export const SERVICE_TABLE: ServiceTable = Object.freeze({
     {
       name: 'surrealdb',
       command: 'surreal',
-      args: ['start', '--log', 'info', '--user', 'root', '--pass', 'root', '--bind', '127.0.0.1:8000'],
+      // The root credentials are *not* passed on the command line. SurrealDB
+      // reads them from `SURREAL_USER` / `SURREAL_PASS`, so they never show
+      // up in a process listing.
+      args: ['start', '--log', 'info', '--bind', '127.0.0.1:8000'],
       readinessPolicy: {
         type: 'http' as const,
         port: DEFAULT_PORTS.surreal,
@@ -112,6 +115,15 @@ export function createBackendEnvironment(params: {
   apiPort?: number | undefined;
   enableDocling?: boolean | string | undefined;
   existingEnv?: Record<string, string | undefined> | undefined;
+  /**
+   * The resolved SurrealDB credentials for this install.
+   *
+   * When omitted, the legacy fixed `root` password is used. That keeps the
+   * contract helpers usable without touching the filesystem, but it is *not*
+   * a secure default: every launcher resolves real credentials through
+   * `scripts/lib/credentials.js` and passes them in here.
+   */
+  credentials?: { user: string; password: string } | undefined;
 }): BackendEnvironment {
   const {
     backendPath,
@@ -121,7 +133,11 @@ export function createBackendEnvironment(params: {
     apiPort = DEFAULT_PORTS.api,
     enableDocling = process.env['OPEN_NOTEBOOK_ENABLE_DOCLING'] ?? 'true',
     existingEnv = process.env,
+    credentials,
   } = params;
+
+  const surrealUser = credentials?.user ?? 'root';
+  const surrealPassword = credentials?.password ?? 'root';
 
   const doclingValue =
     typeof enableDocling === 'boolean'
@@ -135,8 +151,9 @@ export function createBackendEnvironment(params: {
     PYTHONUTF8: '1',
     DATA_FOLDER: dataFolder,
     SURREAL_URL: 'ws://127.0.0.1:8000/rpc',
-    SURREAL_USER: 'root',
-    SURREAL_PASSWORD: 'root',
+    SURREAL_USER: surrealUser,
+    SURREAL_PASSWORD: surrealPassword,
+    SURREAL_PASS: surrealPassword,
     SURREAL_NAMESPACE: 'open_notebook',
     SURREAL_DATABASE: 'open_notebook',
     OPEN_NOTEBOOK_ENCRYPTION_KEY: encryptionKey,

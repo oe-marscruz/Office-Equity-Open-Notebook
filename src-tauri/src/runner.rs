@@ -6,6 +6,7 @@ use std::net::TcpStream;
 use sysinfo::{System, SystemExt};
 use std::env;
 use crate::service_diagnostics::{spawn_logged_child, Service};
+use crate::credentials;
 
 pub fn resolve_runtime_path() -> PathBuf {
     let mut exe_dir = env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
@@ -73,6 +74,13 @@ pub async fn start_services(runtime_path: PathBuf) -> Result<(), String> {
     let data_dir = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(".")).join("OfficeEquityOpenNotebook");
     fs::create_dir_all(&data_dir).unwrap_or_default();
 
+    // Resolve the per-install database credentials and the provider-API-key
+    // encryption key. The credentials travel through the child environment
+    // rather than the command line so they never appear in a process listing.
+    let credentials = credentials::resolve_database_credentials(&data_dir);
+    let credential_env = credentials::build_credential_environment(&credentials);
+    let encryption_key = credentials::ensure_encryption_key(&data_dir);
+
     let logs_dir = data_dir.join("logs");
     fs::create_dir_all(&logs_dir).unwrap_or_default();
 
@@ -83,7 +91,10 @@ pub async fn start_services(runtime_path: PathBuf) -> Result<(), String> {
     fs::create_dir_all(data_dir.join("surrealdb")).unwrap_or_default();
 
     let mut surreal_cmd = std::process::Command::new(runtime_path.join("surreal").join("surreal.exe"));
-    surreal_cmd.args(&["start", "--log", "info", "--user", "root", "--pass", "root", "--bind", "127.0.0.1:8000", &format!("rocksdb:{}", surreal_db_file.display())]);
+    surreal_cmd.args(&["start", "--log", "info", "--bind", "127.0.0.1:8000", &format!("rocksdb:{}", surreal_db_file.display())]);
+    for (name, value) in credential_env.as_pairs() {
+        surreal_cmd.env(name, value);
+    }
     spawn_service(Service::SurrealDb, surreal_cmd, &logs_dir)?;
 
     wait_for_port(8000, 60).await?;
@@ -93,6 +104,13 @@ pub async fn start_services(runtime_path: PathBuf) -> Result<(), String> {
     let mut api_cmd = std::process::Command::new(&python_exe);
     api_cmd.args(&["-m", "uvicorn", "api.main:app", "--host", "127.0.0.1", "--port", "5055"])
            .current_dir(&backend_path);
+    for (name, value) in credential_env.as_pairs() {
+        api_cmd.env(name, value);
+    }
+    api_cmd.env("OPEN_NOTEBOOK_ENCRYPTION_KEY", &encryption_key);
+    api_cmd.env("SURREAL_URL", "ws://127.0.0.1:8000/rpc");
+    api_cmd.env("SURREAL_NAMESPACE", "open_notebook");
+    api_cmd.env("SURREAL_DATABASE", "open_notebook");
     spawn_service(Service::Api, api_cmd, &logs_dir)?;
 
     wait_for_port(5055, 120).await?;
@@ -101,6 +119,13 @@ pub async fn start_services(runtime_path: PathBuf) -> Result<(), String> {
     let mut worker_cmd = std::process::Command::new(&python_exe);
     worker_cmd.args(&["-m", "surreal_commands.cli.worker", "--import-modules", "commands", "--max-tasks", "5"])
               .current_dir(&backend_path);
+    for (name, value) in credential_env.as_pairs() {
+        worker_cmd.env(name, value);
+    }
+    worker_cmd.env("OPEN_NOTEBOOK_ENCRYPTION_KEY", &encryption_key);
+    worker_cmd.env("SURREAL_URL", "ws://127.0.0.1:8000/rpc");
+    worker_cmd.env("SURREAL_NAMESPACE", "open_notebook");
+    worker_cmd.env("SURREAL_DATABASE", "open_notebook");
     spawn_service(Service::Worker, worker_cmd, &logs_dir)?;
 
     // 4. Native Embedded Static & API Reverse Proxy Server

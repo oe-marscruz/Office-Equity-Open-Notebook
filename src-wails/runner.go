@@ -118,12 +118,30 @@ func (sm *ServiceManager) StartServices() error {
 	_ = os.MkdirAll(filepath.Dir(surrealDbFile), 0755)
 	_ = os.MkdirAll(sm.LogDir, 0755)
 
+	// Resolve the per-install database credentials and the provider-API-key
+	// encryption key. The credentials travel through the child environment
+	// rather than the command line so they never appear in a process listing.
+	credentials := ResolveDatabaseCredentials(sm.DataDir)
+	credentialEnv := BuildCredentialEnvironment(credentials)
+	encryptionKey := EnsureEncryptionKey(sm.DataDir)
+
+	backendEnv := map[string]string{
+		"OPEN_NOTEBOOK_ENCRYPTION_KEY": encryptionKey,
+		"SURREAL_URL":                  "ws://127.0.0.1:8000/rpc",
+		"SURREAL_NAMESPACE":            "open_notebook",
+		"SURREAL_DATABASE":             "open_notebook",
+	}
+	for _, pair := range credentialEnv.AsPairs() {
+		backendEnv[pair[0]] = pair[1]
+	}
+
 	configs := []ServiceConfig{
 		{
 			Name:          "surrealdb",
 			Executable:    filepath.Join(sm.RuntimePath, "surreal", "surreal.exe"),
-			Args:          []string{"start", "--log", "info", "--user", "root", "--pass", "root", "--bind", "127.0.0.1:8000", fmt.Sprintf("rocksdb:%s", surrealDbFile)},
+			Args:          []string{"start", "--log", "info", "--bind", "127.0.0.1:8000", fmt.Sprintf("rocksdb:%s", surrealDbFile)},
 			Cwd:           sm.RuntimePath,
+			Env:           backendEnv,
 			ReadinessPort: 8000,
 			Critical:      true,
 			TimeoutSec:    60,
@@ -133,6 +151,7 @@ func (sm *ServiceManager) StartServices() error {
 			Executable:    filepath.Join(sm.RuntimePath, "python", "python.exe"),
 			Args:          []string{"-m", "uvicorn", "api.main:app", "--host", "127.0.0.1", "--port", "5055"},
 			Cwd:           backendPath,
+			Env:           backendEnv,
 			ReadinessPort: 5055,
 			Critical:      true,
 			TimeoutSec:    120,
@@ -142,6 +161,7 @@ func (sm *ServiceManager) StartServices() error {
 			Executable:    filepath.Join(sm.RuntimePath, "python", "python.exe"),
 			Args:          []string{"-m", "surreal_commands.cli.worker", "--import-modules", "commands", "--max-tasks", "2"},
 			Cwd:           backendPath,
+			Env:           backendEnv,
 			ReadinessPort: 0, // Process liveness
 			Critical:      true,
 			TimeoutSec:    30,
