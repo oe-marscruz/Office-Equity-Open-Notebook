@@ -1,9 +1,8 @@
 /**
  * Office of Equity Open Notebook — Secrets, Paths, Diagnostics, Dependencies & Licenses Audit Contract (L8.2)
  *
- * Implements auditing for encryption-key and secret handling across host/environment/logs/diagnostics,
- * redaction verification of sensitive fields and user paths, runtime/download/build dependency version pinning,
- * license inventory generation for redistributed components, and vulnerability scan triage.
+ * Runs isolated synthetic redaction examples and records unverified production checks.
+ * This module does not inspect production logging, scan dependencies, or assess a cloud deployment.
  */
 
 import {
@@ -12,12 +11,11 @@ import {
   DependencyAuditCheck,
   LicenseInventoryItem,
   VulnerabilityTriageItem,
-  SecurityFinding,
   SecurityComplianceAuditReport,
 } from '../types';
 
 /**
- * Helper utility to redact sensitive fields, secrets, API keys, and absolute user paths.
+ * Sample redaction helper. Production logging does not currently call this function.
  */
 export function sanitizeSensitiveData(input: string): string {
   if (typeof input !== 'string') return input;
@@ -40,54 +38,54 @@ export function sanitizeSensitiveData(input: string): string {
 }
 
 /**
- * Traces encryption-key and secret handling through host, environment, logs, and diagnostics.
+ * Lists production evidence still required for secret handling and diagnostics.
  */
 export function traceSecretsAndDiagnostics(): readonly SecretTraceCheck[] {
   return [
     {
       id: 'TRACE_ENV_1',
       category: 'environment',
-      targetField: 'SURREAL_PASS',
-      isRedacted: true,
-      maskPattern: 'SURREAL_PASS=[REDACTED]',
-      passed: true,
-      notes: 'Environment secrets are passed securely via process spawn env objects and excluded from log output.',
+      targetField: 'SURREAL_PASSWORD',
+      isRedacted: false,
+      maskPattern: 'SURREAL_PASSWORD=[REDACTED]',
+      passed: false,
+      notes: 'Unverified: trace database credentials through the actual launcher environment and log sinks.',
     },
     {
       id: 'TRACE_ENV_2',
       category: 'environment',
       targetField: 'ANTHROPIC_API_KEY',
-      isRedacted: true,
+      isRedacted: false,
       maskPattern: 'sk-ant-[REDACTED]',
-      passed: true,
-      notes: 'API keys loaded via local keyring or encrypted env store; never printed in stdout/stderr wrappers.',
+      passed: false,
+      notes: 'Unverified: inspect the actual key store and demonstrate no API key leakage in service output.',
     },
     {
       id: 'TRACE_LOGS_1',
       category: 'logs',
       targetField: 'Application Request Headers',
-      isRedacted: true,
+      isRedacted: false,
       maskPattern: 'Authorization: Bearer [TOKEN_REDACTED]',
-      passed: true,
-      notes: 'Incoming request logging middleware automatically redacts Authorization and Cookie headers.',
+      passed: false,
+      notes: 'Unverified: backend middleware is absent from this checkout; request-header filtering is unknown.',
     },
     {
       id: 'TRACE_DIAG_1',
       category: 'diagnostics',
       targetField: 'Crash Dump & Diagnostic Payloads',
-      isRedacted: true,
+      isRedacted: false,
       maskPattern: '/home/[USER_REDACTED]/...',
-      passed: true,
-      notes: 'Diagnostic bundle generator sanitizes absolute home directory paths and environment variables.',
+      passed: false,
+      notes: 'Launcher output minimization has process-boundary tests; installed-app, backend-owned files, crash and export verification remain outstanding.',
     },
     {
       id: 'TRACE_CONFIG_1',
       category: 'config',
       targetField: 'Database Connection String',
-      isRedacted: true,
+      isRedacted: false,
       maskPattern: 'surreal://user:[REDACTED]@127.0.0.1:8000',
-      passed: true,
-      notes: 'Connection strings omit plain text passwords in diagnostics and UI state displays.',
+      passed: false,
+      notes: 'Unverified: exercise real connection errors and exported diagnostics with synthetic credentials.',
     },
   ];
 }
@@ -142,180 +140,120 @@ export function runRedactionTests(): readonly RedactionTestCheck[] {
   });
 }
 
-/**
- * Audits runtime, download, and build dependencies and pinned versions.
- */
+/** No production dependency scan or license review has been performed here. */
 export function auditDependencies(): readonly DependencyAuditCheck[] {
-  return [
-    {
-      componentName: 'electron',
-      version: '^33.2.0',
-      sourceType: 'npm',
-      pinned: false,
-      vulnerabilitiesFound: 0,
-      status: 'compliant',
-      notes: 'Retained as rollback fallback shell; native Tauri shell is primary.',
-    },
-    {
-      componentName: 'typescript',
-      version: '^5.7.3',
-      sourceType: 'npm',
-      pinned: true,
-      vulnerabilitiesFound: 0,
-      status: 'compliant',
-      notes: 'Strict type checking enforced during build:types.',
-    },
-    {
-      componentName: '@tauri-apps/api',
-      version: '^2.0.0',
-      sourceType: 'cargo',
-      pinned: true,
-      vulnerabilitiesFound: 0,
-      status: 'compliant',
-      notes: 'Rust native host shell core framework.',
-    },
-    {
-      componentName: 'surrealdb',
-      version: 'v2.0.x',
-      sourceType: 'native',
-      pinned: true,
-      vulnerabilitiesFound: 0,
-      status: 'compliant',
-      notes: 'Embedded local database binary packaged securely in runtime layout.',
-    },
-    {
-      componentName: 'fastapi',
-      version: '0.115.x',
-      sourceType: 'python',
-      pinned: true,
-      vulnerabilitiesFound: 0,
-      status: 'compliant',
-      notes: 'Local Python backend worker framework bound to 127.0.0.1.',
-    },
-  ];
+  return [];
 }
 
-/**
- * Generates license inventory for redistributed components.
- */
 export function generateLicenseInventory(): readonly LicenseInventoryItem[] {
-  return [
-    {
-      componentName: 'Tauri Framework',
-      version: '2.0.x',
-      license: 'MIT / Apache-2.0',
-      redistributable: true,
-      attributionRequired: true,
-    },
-    {
-      componentName: 'SurrealDB',
-      version: 'v2.0.x',
-      license: 'BSL 1.1 / Apache-2.0',
-      redistributable: true,
-      attributionRequired: true,
-    },
-    {
-      componentName: 'FastAPI / Uvicorn',
-      version: '0.115.x',
-      license: 'MIT',
-      redistributable: true,
-      attributionRequired: true,
-    },
-    {
-      componentName: 'React / Frontend Runtime',
-      version: '18.x',
-      license: 'MIT',
-      redistributable: true,
-      attributionRequired: false,
-    },
-    {
-      componentName: 'Node.js (Build / Tooling Only)',
-      version: '22.14.0',
-      license: 'MIT',
-      redistributable: false, // Node runtime excluded from production release per X20
-      attributionRequired: false,
-    },
-  ];
+  return [];
 }
 
-/**
- * Runs vulnerability triage and scans for unpatched CVEs.
- */
 export function triageVulnerabilities(): readonly VulnerabilityTriageItem[] {
-  return [
-    {
-      cveId: 'CVE-2024-0000-MOCK',
-      component: 'Node Runtime Tooling',
-      severity: 'none',
-      status: 'patched',
-      description: 'Mock demonstration of vulnerability triage record for build tooling.',
-      remediation: 'Node.js excluded from production deployment package (X20 runtime simplification).',
-    },
-  ];
+  return [];
 }
 
-/**
- * Executes the full security compliance audit (L8.2).
- */
+/** Runs sample redaction checks without granting production compliance. */
 export function runSecurityComplianceAudit(): SecurityComplianceAuditReport {
-  const secretTraceAudits = traceSecretsAndDiagnostics();
   const redactionTests = runRedactionTests();
-  const dependencyAudits = auditDependencies();
-  const licenseInventory = generateLicenseInventory();
-  const vulnerabilityTriage = triageVulnerabilities();
-
-  const allRedactionPassed = redactionTests.every((r) => r.passed);
-  const allSecretTracePassed = secretTraceAudits.every((s) => s.passed);
-  const allDepsCompliant = dependencyAudits.every((d) => d.status === 'compliant');
-  const allLicensesValid = licenseInventory.every((l) => l.redistributable !== undefined);
-
-  const findings: SecurityFinding[] = [
-    {
-      id: 'FINDING_L8_2_01',
-      severity: 'low',
-      title: 'Environment Secret Masking in Diagnostics',
-      status: 'resolved',
-      description: 'Ensure diagnostic bundles scrub absolute user home paths and database connection passwords.',
-      remediation: 'Implemented sanitizeSensitiveData regex filters in diagnostics reporting pipeline.',
-    },
-  ];
-
-  const fullyCompliant = allRedactionPassed && allSecretTracePassed && allDepsCompliant && allLicensesValid;
-
   return {
     packetId: 'L8.2',
-    title: 'L8.2: Audit Secrets, Paths, Diagnostics, Dependencies, and Licenses Report',
+    evidenceKind: 'synthetic-contract-fixtures',
+    productionControlsVerified: false,
+    vulnerabilityScanPerformed: false,
+    title: 'L8.2 synthetic redaction checks and outstanding security evidence',
     timestamp: new Date().toISOString(),
-    secretTraceAudits,
+    limitations: [
+      'Only synthetic redaction examples were executed; the helper is not integrated into production log sinks.',
+      'Secret handling, request middleware, diagnostics exports, and backend authorization are unverified.',
+      'No dependency vulnerability scan, resolved runtime inventory, or redistribution license review was performed.',
+      'No Azure tenant, deployed resources, data governance review, or FERPA compliance assessment was performed.',
+    ],
+    secretTraceAudits: traceSecretsAndDiagnostics(),
     redactionTests,
-    dependencyAudits,
-    licenseInventory,
-    vulnerabilityTriage,
-    findings,
+    dependencyAudits: auditDependencies(),
+    licenseInventory: generateLicenseInventory(),
+    vulnerabilityTriage: triageVulnerabilities(),
+    findings: [{
+      id: 'FINDING_L8_2_01',
+      severity: 'high',
+      title: 'Production diagnostic redaction remains unverified',
+      status: 'open',
+      description: 'Passing isolated redaction examples does not prove protection of service logs or diagnostic bundles.',
+      remediation: 'Minimize production diagnostic content and verify all actual sinks using synthetic credentials and record content.',
+    }],
     verdict: {
-      fullyCompliant,
-      summary: fullyCompliant
-        ? 'All secrets and paths successfully traced and redacted; dependencies pinned and audited; license inventory verified; vulnerability triage complete.'
-        : 'Security compliance audit encountered non-compliant items.',
+      fullyCompliant: false,
+      fixtureChecksPassed: redactionTests.length > 0 && redactionTests.every(check => check.passed),
+      summary: 'Synthetic redaction examples only. Production security and cloud controls remain unverified; this report cannot authorize a release or use of education records.',
     },
   };
 }
 
-/**
- * Validates security compliance audit report schema.
- */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Rejects legacy or malformed reports that omit evidence scope or claim compliance. */
 export function validateSecurityComplianceAuditReport(
-  report: SecurityComplianceAuditReport
+  report: unknown
 ): { valid: boolean; errors: readonly string[] } {
+  if (!isRecord(report)) {
+    return { valid: false, errors: ['Report must be a non-null object'] };
+  }
   const errors: string[] = [];
-  if (report.packetId !== 'L8.2') errors.push("Invalid packetId, expected 'L8.2'");
-  if (!report.secretTraceAudits || report.secretTraceAudits.length === 0) errors.push('Missing secret trace audits');
-  if (!report.redactionTests || report.redactionTests.length === 0) errors.push('Missing redaction tests');
-  if (!report.dependencyAudits || report.dependencyAudits.length === 0) errors.push('Missing dependency audits');
-  if (!report.licenseInventory || report.licenseInventory.length === 0) errors.push('Missing license inventory');
-  if (!report.verdict || typeof report.verdict.fullyCompliant !== 'boolean') errors.push('Missing or invalid verdict');
-  return {
-    valid: errors.length === 0,
-    errors,
-  };
+  if (report['packetId'] !== 'L8.2') errors.push('Invalid packetId');
+  if (report['evidenceKind'] !== 'synthetic-contract-fixtures') errors.push('Missing or invalid evidence scope');
+  if (report['productionControlsVerified'] !== false) errors.push('Production controls must remain unverified');
+  if (report['vulnerabilityScanPerformed'] !== false) errors.push('No vulnerability scan was performed');
+  if (typeof report['title'] !== 'string' || !report['title'].trim()) errors.push('Missing title');
+  if (typeof report['timestamp'] !== 'string' || !Number.isFinite(Date.parse(report['timestamp']))) errors.push('Invalid timestamp');
+  const limitations = report['limitations'];
+  if (!Array.isArray(limitations) || limitations.length === 0 ||
+      !limitations.every(item => typeof item === 'string' && item.trim().length > 0)) {
+    errors.push('Missing assessment limitations');
+  }
+  for (const key of ['secretTraceAudits', 'redactionTests', 'dependencyAudits', 'licenseInventory', 'vulnerabilityTriage', 'findings']) {
+    if (!Array.isArray(report[key])) errors.push(`Missing or invalid ${key}`);
+  }
+  for (const key of ['dependencyAudits', 'licenseInventory', 'vulnerabilityTriage']) {
+    const entries = report[key];
+    if (Array.isArray(entries) && entries.length !== 0) errors.push(`${key} contains evidence that was not collected`);
+  }
+  const hasTextFields = (value: Record<string, unknown>, keys: readonly string[]) =>
+    keys.every(key => typeof value[key] === 'string' && (value[key] as string).trim().length > 0);
+  const traces = report['secretTraceAudits'];
+  if (!Array.isArray(traces) || traces.length === 0 || !traces.every(trace =>
+      isRecord(trace) && trace['passed'] === false && trace['isRedacted'] === false &&
+      typeof trace['category'] === 'string' &&
+      ['environment', 'logs', 'diagnostics', 'config'].includes(trace['category']) &&
+      hasTextFields(trace, ['id', 'targetField', 'maskPattern', 'notes']))) {
+    errors.push('Missing or invalid unverified secret traces');
+  }
+  const findings = report['findings'];
+  if (!Array.isArray(findings) || findings.length === 0 || !findings.every(finding =>
+      isRecord(finding) && finding['status'] === 'open' &&
+      typeof finding['severity'] === 'string' &&
+      ['critical', 'high', 'medium', 'low', 'none'].includes(finding['severity']) &&
+      hasTextFields(finding, ['id', 'title', 'description', 'remediation']))) {
+    errors.push('Missing or invalid outstanding findings');
+  }
+  const checks = report['redactionTests'];
+  const validChecks = Array.isArray(checks) && checks.length > 0 && checks.every(check =>
+    isRecord(check) && typeof check['passed'] === 'boolean' &&
+    typeof check['id'] === 'string' && typeof check['sensitiveField'] === 'string' &&
+    typeof check['inputSample'] === 'string' && typeof check['redactedOutput'] === 'string');
+  if (!validChecks) errors.push('Missing or invalid synthetic redaction checks');
+  const verdict = report['verdict'];
+  if (!isRecord(verdict)) {
+    errors.push('Missing verdict');
+  } else {
+    if (verdict['fullyCompliant'] !== false) errors.push('Fixture evidence cannot establish production compliance');
+    if (typeof verdict['fixtureChecksPassed'] !== 'boolean') errors.push('Invalid fixture verdict');
+    if (typeof verdict['summary'] !== 'string' || !verdict['summary'].trim()) errors.push('Missing verdict summary');
+    if (validChecks && verdict['fixtureChecksPassed'] !== checks.every(check => check['passed'])) {
+      errors.push('Fixture verdict does not match the redaction checks');
+    }
+  }
+  return { valid: errors.length === 0, errors };
 }

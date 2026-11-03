@@ -1,52 +1,61 @@
 {
   "packetId": "L8.2",
-  "title": "L8.2: Audit Secrets, Paths, Diagnostics, Dependencies, and Licenses Report",
-  "timestamp": "2026-10-13T04:12:05.894Z",
+  "evidenceKind": "synthetic-contract-fixtures",
+  "productionControlsVerified": false,
+  "vulnerabilityScanPerformed": false,
+  "title": "L8.2 synthetic redaction checks and outstanding security evidence",
+  "timestamp": "2026-11-03T15:48:57.712Z",
+  "limitations": [
+    "Only synthetic redaction examples were executed; the helper is not integrated into production log sinks.",
+    "Secret handling, request middleware, diagnostics exports, and backend authorization are unverified.",
+    "No dependency vulnerability scan, resolved runtime inventory, or redistribution license review was performed.",
+    "No Azure tenant, deployed resources, data governance review, or FERPA compliance assessment was performed."
+  ],
   "secretTraceAudits": [
     {
       "id": "TRACE_ENV_1",
       "category": "environment",
-      "targetField": "SURREAL_PASS",
-      "isRedacted": true,
-      "maskPattern": "SURREAL_PASS=[REDACTED]",
-      "passed": true,
-      "notes": "Environment secrets are passed securely via process spawn env objects and excluded from log output."
+      "targetField": "SURREAL_PASSWORD",
+      "isRedacted": false,
+      "maskPattern": "SURREAL_PASSWORD=[REDACTED]",
+      "passed": false,
+      "notes": "Unverified: trace database credentials through the actual launcher environment and log sinks."
     },
     {
       "id": "TRACE_ENV_2",
       "category": "environment",
       "targetField": "ANTHROPIC_API_KEY",
-      "isRedacted": true,
+      "isRedacted": false,
       "maskPattern": "sk-ant-[REDACTED]",
-      "passed": true,
-      "notes": "API keys loaded via local keyring or encrypted env store; never printed in stdout/stderr wrappers."
+      "passed": false,
+      "notes": "Unverified: inspect the actual key store and demonstrate no API key leakage in service output."
     },
     {
       "id": "TRACE_LOGS_1",
       "category": "logs",
       "targetField": "Application Request Headers",
-      "isRedacted": true,
+      "isRedacted": false,
       "maskPattern": "Authorization: Bearer [TOKEN_REDACTED]",
-      "passed": true,
-      "notes": "Incoming request logging middleware automatically redacts Authorization and Cookie headers."
+      "passed": false,
+      "notes": "Unverified: backend middleware is absent from this checkout; request-header filtering is unknown."
     },
     {
       "id": "TRACE_DIAG_1",
       "category": "diagnostics",
       "targetField": "Crash Dump & Diagnostic Payloads",
-      "isRedacted": true,
+      "isRedacted": false,
       "maskPattern": "/home/[USER_REDACTED]/...",
-      "passed": true,
-      "notes": "Diagnostic bundle generator sanitizes absolute home directory paths and environment variables."
+      "passed": false,
+      "notes": "Launcher output minimization has process-boundary tests; installed-app, backend-owned files, crash and export verification remain outstanding."
     },
     {
       "id": "TRACE_CONFIG_1",
       "category": "config",
       "targetField": "Database Connection String",
-      "isRedacted": true,
+      "isRedacted": false,
       "maskPattern": "surreal://user:[REDACTED]@127.0.0.1:8000",
-      "passed": true,
-      "notes": "Connection strings omit plain text passwords in diagnostics and UI state displays."
+      "passed": false,
+      "notes": "Unverified: exercise real connection errors and exported diagnostics with synthetic credentials."
     }
   ],
   "redactionTests": [
@@ -86,112 +95,22 @@
       "passed": true
     }
   ],
-  "dependencyAudits": [
-    {
-      "componentName": "electron",
-      "version": "^33.2.0",
-      "sourceType": "npm",
-      "pinned": false,
-      "vulnerabilitiesFound": 0,
-      "status": "compliant",
-      "notes": "Retained as rollback fallback shell; native Tauri shell is primary."
-    },
-    {
-      "componentName": "typescript",
-      "version": "^5.7.3",
-      "sourceType": "npm",
-      "pinned": true,
-      "vulnerabilitiesFound": 0,
-      "status": "compliant",
-      "notes": "Strict type checking enforced during build:types."
-    },
-    {
-      "componentName": "@tauri-apps/api",
-      "version": "^2.0.0",
-      "sourceType": "cargo",
-      "pinned": true,
-      "vulnerabilitiesFound": 0,
-      "status": "compliant",
-      "notes": "Rust native host shell core framework."
-    },
-    {
-      "componentName": "surrealdb",
-      "version": "v2.0.x",
-      "sourceType": "native",
-      "pinned": true,
-      "vulnerabilitiesFound": 0,
-      "status": "compliant",
-      "notes": "Embedded local database binary packaged securely in runtime layout."
-    },
-    {
-      "componentName": "fastapi",
-      "version": "0.115.x",
-      "sourceType": "python",
-      "pinned": true,
-      "vulnerabilitiesFound": 0,
-      "status": "compliant",
-      "notes": "Local Python backend worker framework bound to 127.0.0.1."
-    }
-  ],
-  "licenseInventory": [
-    {
-      "componentName": "Tauri Framework",
-      "version": "2.0.x",
-      "license": "MIT / Apache-2.0",
-      "redistributable": true,
-      "attributionRequired": true
-    },
-    {
-      "componentName": "SurrealDB",
-      "version": "v2.0.x",
-      "license": "BSL 1.1 / Apache-2.0",
-      "redistributable": true,
-      "attributionRequired": true
-    },
-    {
-      "componentName": "FastAPI / Uvicorn",
-      "version": "0.115.x",
-      "license": "MIT",
-      "redistributable": true,
-      "attributionRequired": true
-    },
-    {
-      "componentName": "React / Frontend Runtime",
-      "version": "18.x",
-      "license": "MIT",
-      "redistributable": true,
-      "attributionRequired": false
-    },
-    {
-      "componentName": "Node.js (Build / Tooling Only)",
-      "version": "22.14.0",
-      "license": "MIT",
-      "redistributable": false,
-      "attributionRequired": false
-    }
-  ],
-  "vulnerabilityTriage": [
-    {
-      "cveId": "CVE-2024-0000-MOCK",
-      "component": "Node Runtime Tooling",
-      "severity": "none",
-      "status": "patched",
-      "description": "Mock demonstration of vulnerability triage record for build tooling.",
-      "remediation": "Node.js excluded from production deployment package (X20 runtime simplification)."
-    }
-  ],
+  "dependencyAudits": [],
+  "licenseInventory": [],
+  "vulnerabilityTriage": [],
   "findings": [
     {
       "id": "FINDING_L8_2_01",
-      "severity": "low",
-      "title": "Environment Secret Masking in Diagnostics",
-      "status": "resolved",
-      "description": "Ensure diagnostic bundles scrub absolute user home paths and database connection passwords.",
-      "remediation": "Implemented sanitizeSensitiveData regex filters in diagnostics reporting pipeline."
+      "severity": "high",
+      "title": "Production diagnostic redaction remains unverified",
+      "status": "open",
+      "description": "Passing isolated redaction examples does not prove protection of service logs or diagnostic bundles.",
+      "remediation": "Minimize production diagnostic content and verify all actual sinks using synthetic credentials and record content."
     }
   ],
   "verdict": {
-    "fullyCompliant": true,
-    "summary": "All secrets and paths successfully traced and redacted; dependencies pinned and audited; license inventory verified; vulnerability triage complete."
+    "fullyCompliant": false,
+    "fixtureChecksPassed": true,
+    "summary": "Synthetic redaction examples only. Production security and cloud controls remain unverified; this report cannot authorize a release or use of education records."
   }
 }
