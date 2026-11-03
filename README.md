@@ -23,22 +23,22 @@
 
 ## 📖 What Is It?
 
-**Office of Equity Open Notebook** is a self-contained Windows desktop application built for the **Office of Equity**. It wraps the full [Open Notebook](https://github.com/lfnovo/open-notebook) stack — a private, multi-model, 100% local alternative to Notebook LM — into a single installable Electron application with zero Docker or system dependency requirements.
+**Office of Equity Open Notebook** is a self-contained Windows desktop application built for the **Office of Equity**. It wraps the full [Open Notebook](https://github.com/lfnovo/open-notebook) stack — a private, multi-model, 100% local alternative to Notebook LM — into a single installable Electron application with zero system dependency requirements.
 
 > **Open Notebook** empowers you to control your data, choose your AI models (18+ providers including OpenAI, Anthropic, Ollama, and LM Studio), organize multi-modal content, generate professional podcasts, search intelligently, and chat with context — all powered by your research materials. Learn more at [open-notebook.ai](https://www.open-notebook.ai).
 
 ### What makes this version different?
 
-Unlike the upstream project (which runs via Docker), **this version is a native Windows desktop app**:
+This version is a native Windows desktop app:
 
-| Capability | Upstream (Docker) | This Desktop App |
-| --- | --- | --- |
-| **Installation** | Requires Docker Desktop | Single installer (.exe) — no Docker |
-| **Runtimes** | Container-managed | Bundled Python 3.12 + Node.js |
-| **Database** | Containerized SurrealDB | Bundled SurrealDB binary |
-| **Docling Engine** | Opt-in, installed on first boot | Pre-installed in the runtime |
-| **Offline** | Needs network for first boot extras | Fully offline after install |
-| **User Data** | Docker volume | `%APPDATA%\Office of Equity Open Notebook` |
+| Capability | Desktop App |
+| --- | --- |
+| **Installation** | Single installer (.exe) |
+| **Runtimes** | Bundled Python 3.12 + Node.js |
+| **Database** | Bundled SurrealDB binary |
+| **Docling Engine** | Pre-installed in the runtime |
+| **Offline** | Fully offline after install |
+| **User Data** | `%APPDATA%\Office of Equity Open Notebook` |
 
 ---
 
@@ -62,7 +62,7 @@ Everything from upstream **Open Notebook**, plus desktop-specific additions:
 - **🔒 Encryption at Rest** — API keys encrypted with a locally-generated key
 
 ### Desktop-Specific
-- **🖥️ Native Windows App** — Installs via a single .exe, runs without Docker or system Python/Node
+- **🖥️ Native Windows App** — Installs via a single .exe, runs without system Python/Node
 - **🔇 Fully Hidden Services** — SurrealDB, API, worker, and frontend run with no console windows
 - **📁 Portable User Data** — All data lives in `%APPDATA%`, separate from the install folder
 - **🧩 Optional Runtimes** — Installer lets you skip bundled Python/Node if you already have them

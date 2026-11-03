@@ -256,9 +256,8 @@ function buildPython(repo) {
   );
 
   // Install the opt-in Docling extraction engine (content-core[docling]).
-  // This mirrors the Docker entrypoint's on-demand install
-  // (scripts/docker-entrypoint.sh) but pre-installs it into the bundled
-  // runtime so the desktop app works fully offline. Pin the extra to the
+  // Pre-installs it into the bundled runtime so the desktop app works
+  // fully offline. Pin the extra to the
   // installed content-core version so its transitive deps stay compatible
   // with the locked base install.
   // `cp()` copies the *contents* of the uv-managed interpreter directory.

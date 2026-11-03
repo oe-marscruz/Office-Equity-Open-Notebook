@@ -7,7 +7,7 @@ name the concepts reviewers, ADRs, and future architecture work should use.
 
 **Office of Equity Open Notebook** — a self-contained Windows desktop app
 wrapping the upstream [Open Notebook](https://github.com/lfnovo/open-notebook)
-stack in an Electron shell, with zero Docker or system-dependency requirements.
+stack in an Electron shell, with zero system-dependency requirements.
 
 ## Runtime pieces
 
