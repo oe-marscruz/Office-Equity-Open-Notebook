@@ -51,7 +51,7 @@ async function main() {
   process.on('SIGTERM', stop);
 }
 
-main().catch((err) => {
-  console.error('Failed to start services:', err && err.message);
+main().catch(() => {
+  console.error('SERVICE_STARTUP_FAILED');
   process.exit(1);
 });

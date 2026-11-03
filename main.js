@@ -45,7 +45,7 @@ async function stopServices() {
     try {
       await services.stop();
     } catch (err) {
-      console.error('Error stopping services:', err);
+      console.error('SERVICE_SHUTDOWN_FAILED');
     }
   }
 }
@@ -111,8 +111,7 @@ app.whenReady().then(async () => {
   if (missing.length > 0) {
     showErrorAndExit(
       'Office of Equity Open Notebook — runtime not found',
-      'The bundled runtime is incomplete. Please re-run `npm run prepare:runtime` and rebuild the app.\n\nMissing:\n' +
-        missing.join('\n')
+      'The bundled runtime is incomplete. Please re-run `npm run prepare:runtime` and rebuild the app.'
     );
     return;
   }
@@ -125,11 +124,13 @@ app.whenReady().then(async () => {
       waitReady: true,
     });
   } catch (err) {
-    showErrorAndExit('Office of Equity Open Notebook — failed to start', String(err && err.message));
+    showErrorAndExit('Office of Equity Open Notebook — failed to start', 'SERVICE_STARTUP_FAILED: Review the service lifecycle diagnostics.');
     return;
   }
 
   createWindow();
+}).catch(() => {
+  showErrorAndExit('Office of Equity Open Notebook - failed to start', 'SERVICE_STARTUP_FAILED: Review the service lifecycle diagnostics.');
 });
 
 app.on('window-all-closed', async () => {

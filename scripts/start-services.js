@@ -11,7 +11,8 @@
  * by the standalone `scripts/run-services.js` CLI for headless verification.
  */
 
-const { spawn, execFileSync } = require('child_process');
+const { execFileSync } = require('child_process');
+const { spawnServiceProcess } = require('./service-diagnostics');
 const net = require('net');
 const http = require('http');
 const path = require('path');
@@ -233,50 +234,11 @@ async function startServices(cfg) {
   };
 
   const children = [];
-  const logStreams = new Map();
-
-  function getLogStream(name) {
-    if (!logStreams.has(name)) {
-      const file = path.join(logsDir, `${name}.log`);
-      const stream = fs.createWriteStream(file, { flags: 'a' });
-      logStreams.set(name, stream);
-    }
-    return logStreams.get(name);
-  }
-
-  function logLine(name, stream, data) {
-    const line = String(data).trimEnd();
-    if (!line) return;
-    const tag = `[${name}:${stream}]`;
-    const timestamp = new Date().toISOString();
-    const formatted = `${timestamp} ${tag} ${line}\n`;
-    const outStream = getLogStream(name);
-    outStream.write(formatted);
-    // Also mirror to the parent console for dev/debug visibility.
-    if (stream === 'err') {
-      console.error(formatted.trimEnd());
-    } else {
-      console.log(formatted.trimEnd());
-    }
-  }
-
-  function spawnService(name, cmd, args, opts) {
-    const child = spawn(cmd, args, {
+  function spawnService(name, command, args, opts) {
+    const child = spawnServiceProcess(name, command, args, {
       cwd: opts.cwd || dataDir,
       env: opts.env || backendEnv,
-      windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    child.stdout.on('data', (d) => logLine(name, 'out', d));
-    child.stderr.on('data', (d) => logLine(name, 'err', d));
-    child.on('error', (err) => console.error(`[${name}] spawn error: ${err.message}`));
-    child.on('exit', (code, signal) => {
-      const msg = `[${name}] exited (code=${code}, signal=${signal})`;
-      logLine(name, 'out', msg);
-      // If a critical service exits unexpectedly, surface it.
-      if (code !== 0 && code !== null && !child.killed) {
-        console.error(`CRITICAL: ${name} exited unexpectedly. Check ${path.join(logsDir, `${name}.log`)}`);
-      }
+      logsDir,
     });
     children.push(child);
     return child;
@@ -334,14 +296,6 @@ async function startServices(cfg) {
           if (child.exitCode === null && !child.killed) {
             child.kill('SIGKILL');
           }
-        } catch (_) {
-          /* ignore */
-        }
-      }
-      // Close log file streams.
-      for (const stream of logStreams.values()) {
-        try {
-          stream.end();
         } catch (_) {
           /* ignore */
         }

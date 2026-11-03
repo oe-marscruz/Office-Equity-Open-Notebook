@@ -4,10 +4,8 @@ use std::time::Duration;
 use tokio::time::sleep;
 use std::net::TcpStream;
 use sysinfo::{System, SystemExt};
-use serde_json::Value;
-use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use std::env;
+use crate::service_diagnostics::{spawn_logged_child, Service};
 
 pub fn resolve_runtime_path() -> PathBuf {
     let mut exe_dir = env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
@@ -84,26 +82,26 @@ pub async fn start_services(runtime_path: PathBuf) -> Result<(), String> {
     let surreal_db_file = data_dir.join("surrealdb").join("mydatabase.db");
     fs::create_dir_all(data_dir.join("surrealdb")).unwrap_or_default();
 
-    let mut surreal_cmd = tokio::process::Command::new(runtime_path.join("surreal").join("surreal.exe"));
+    let mut surreal_cmd = std::process::Command::new(runtime_path.join("surreal").join("surreal.exe"));
     surreal_cmd.args(&["start", "--log", "info", "--user", "root", "--pass", "root", "--bind", "127.0.0.1:8000", &format!("rocksdb:{}", surreal_db_file.display())]);
-    spawn_service("surrealdb", surreal_cmd, &logs_dir)?;
+    spawn_service(Service::SurrealDb, surreal_cmd, &logs_dir)?;
 
     wait_for_port(8000, 60).await?;
 
     // 2. API
     let python_exe = runtime_path.join("python").join("python.exe");
-    let mut api_cmd = tokio::process::Command::new(&python_exe);
+    let mut api_cmd = std::process::Command::new(&python_exe);
     api_cmd.args(&["-m", "uvicorn", "api.main:app", "--host", "127.0.0.1", "--port", "5055"])
            .current_dir(&backend_path);
-    spawn_service("api", api_cmd, &logs_dir)?;
+    spawn_service(Service::Api, api_cmd, &logs_dir)?;
 
     wait_for_port(5055, 120).await?;
 
     // 3. Worker
-    let mut worker_cmd = tokio::process::Command::new(&python_exe);
+    let mut worker_cmd = std::process::Command::new(&python_exe);
     worker_cmd.args(&["-m", "surreal_commands.cli.worker", "--import-modules", "commands", "--max-tasks", "5"])
               .current_dir(&backend_path);
-    spawn_service("worker", worker_cmd, &logs_dir)?;
+    spawn_service(Service::Worker, worker_cmd, &logs_dir)?;
 
     // 4. Native Embedded Static & API Reverse Proxy Server
     let static_dir = runtime_path.join("frontend").join("static");
@@ -114,8 +112,8 @@ pub async fn start_services(runtime_path: PathBuf) -> Result<(), String> {
     };
 
     tokio::spawn(async move {
-        if let Err(err) = crate::server::start_embedded_server(8502, static_dir_final).await {
-            eprintln!("CRITICAL: Native embedded HTTP server failed: {}", err);
+        if crate::server::start_embedded_server(8502, static_dir_final).await.is_err() {
+            eprintln!("NATIVE_HTTP_SERVER_FAILED");
         }
     });
 
@@ -124,80 +122,20 @@ pub async fn start_services(runtime_path: PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-fn spawn_service(name: &'static str, mut cmd: tokio::process::Command, logs_dir: &Path) -> Result<(), String> {
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-
-    let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn {}: {}", name, e))?;
-
+fn spawn_service(service: Service, mut command: std::process::Command, logs_dir: &Path) -> Result<(), String> {
+    let mut child = spawn_logged_child(service, &mut command, logs_dir).map_err(str::to_owned)?;
     #[cfg(target_os = "windows")]
-    {
-        if let Some(handle) = child.raw_handle() {
-            let _ = crate::job_object::apply_job_object_to_process(handle as winapi::um::winnt::HANDLE);
+        {
+            let handle = child.raw_handle() as winapi::um::winnt::HANDLE;
+            let _ = crate::job_object::apply_job_object_to_process(handle);
         }
-    }
-
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-
-    let logs_dir_clone = logs_dir.to_path_buf();
-    let name_clone = name.to_string();
     tokio::spawn(async move {
-        use tokio::io::AsyncWriteExt;
-        let log_file_path = logs_dir_clone.join(format!("{}.log", name_clone));
-        let mut file = tokio::fs::OpenOptions::new().create(true).append(true).open(&log_file_path).await.unwrap();
-
-        let mut reader = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            let line = line.trim();
-            if !line.is_empty() {
-                let log_entry = serde_json::json!({
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                    "name": name_clone,
-                    "stream": "out",
-                    "data": line
-                });
-                let mut log_str = log_entry.to_string();
-                println!("{}", log_str);
-                log_str.push('\n');
-                let _ = file.write_all(log_str.as_bytes()).await;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => sleep(Duration::from_millis(100)).await,
             }
         }
     });
-
-    let err_name = name.to_string();
-    let logs_dir_err = logs_dir.to_path_buf();
-    tokio::spawn(async move {
-        use tokio::io::AsyncWriteExt;
-        let log_file_path = logs_dir_err.join(format!("{}.log", err_name));
-        let mut file = tokio::fs::OpenOptions::new().create(true).append(true).open(&log_file_path).await.unwrap();
-
-        let mut reader = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            let line = line.trim();
-            if !line.is_empty() {
-                let log_entry = serde_json::json!({
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                    "name": err_name,
-                    "stream": "err",
-                    "data": line
-                });
-                let mut log_str = log_entry.to_string();
-                eprintln!("{}", log_str);
-                log_str.push('\n');
-                let _ = file.write_all(log_str.as_bytes()).await;
-            }
-        }
-    });
-
-    tokio::spawn(async move {
-        let _ = child.wait().await;
-    });
-
     Ok(())
 }
