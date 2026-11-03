@@ -1,7 +1,7 @@
 # Modernization State
 
 ## Current Packet
-`L8.5` (Completed — Prompt 45 / Initiative Complete)
+`Security hardening re-port` (Completed — per-install credential store across all five hosts)
 
 ## Completed Packets
 - `L0.1`: Pin upstream revision and build provenance. (Completed)
@@ -51,4 +51,12 @@
 - Modernization initiative successfully completed across all 31 workstreams (L0.1 - L8.5).
 - Architecture and operations documentation compiled at `docs/modernization/ARCHITECTURE_OPERATIONS.md`.
 - Final empirical benchmark scorecard saved at `.artifacts/reports/l8_5/final_scorecard_and_operations.json`.
-- All 27 automated mechanical test suites passing successfully via `node scripts/orchestrator/verifier.js`.
+- All 29 automated mechanical test suites passing successfully via `node scripts/orchestrator/verifier.js`.
+
+## Security Hardening Re-port
+- The fixed SurrealDB `root`/`root` credential was replaced with a per-install random password, stored obfuscated and ACL-restricted to the current OS user.
+- The on-disk secret store is implemented identically by the Node/Electron, TypeScript contract, Rust/Tauri, Go/Wails and C#/WinUI hosts, pinned by the shared fixture `tests/contracts/credentials-cases.json`.
+- Credentials travel to SurrealDB and the Python backend through the child process environment, so they never appear in a command line or a process listing.
+- Datastores created by older builds keep their original password, because SurrealDB applies initial root credentials only to a new datastore.
+- Handoff: `docs/compliance/ferpa/CREDENTIAL_STORE_HANDOFF.md`. Inventory rows updated in `docs/compliance/ferpa/CODEBASE_SECURITY_INVENTORY.md`.
+- Known limits: no .NET SDK (C# source-only), empty Go module cache (Go verified in an isolated stdlib module), and no assembled runtime (contract-level verification only).
