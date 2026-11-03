@@ -150,10 +150,13 @@ const DATABASE_FILENAME = 'mydatabase.db';
 function hasExistingDatastore(dataDir) {
   const file = path.join(dataDir, DATABASE_DIRNAME, DATABASE_FILENAME);
   try {
-    // A zero-byte placeholder holds no stored root credentials, so SurrealDB
-    // initializes it fresh and the generated password does apply. Only a
-    // non-empty datastore can lock the backend out.
-    return fs.statSync(file).size > 0;
+    // RocksDB stores its datastore in a directory, which reports size 0 on Windows.
+    // Check both for non-empty directories and non-empty files.
+    const st = fs.statSync(file);
+    if (st.isDirectory()) {
+      return fs.readdirSync(file).length > 0;
+    }
+    return st.size > 0;
   } catch (_) {
     return false;
   }
