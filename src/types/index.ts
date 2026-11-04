@@ -184,6 +184,11 @@ export interface BackendEnvironment extends Record<string, string | undefined> {
   SURREAL_URL: string;
   SURREAL_USER: string;
   SURREAL_PASSWORD: string;
+  /**
+   * Read by the SurrealDB CLI itself. Always carries the same value as
+   * `SURREAL_PASSWORD`.
+   */
+  SURREAL_PASS: string;
   SURREAL_NAMESPACE: string;
   SURREAL_DATABASE: string;
   OPEN_NOTEBOOK_ENCRYPTION_KEY: string;
@@ -191,6 +196,70 @@ export interface BackendEnvironment extends Record<string, string | undefined> {
   TIKTOKEN_CACHE_DIR: string;
   API_HOST: string;
   API_PORT: string;
+}
+
+// ============================================================================
+// Credential & Secret Storage Contracts
+// ============================================================================
+
+/**
+ * Where a resolved database password came from.
+ *
+ * - `legacy`: the install predates per-install credentials, so the fixed
+ *   `root` password is retained to keep the existing datastore reachable.
+ * - `stored`: the password was read back from `secrets.json`.
+ * - `generated`: a new random password was created for this install.
+ */
+export type DatabaseCredentialSource = 'legacy' | 'stored' | 'generated';
+
+export interface DatabaseCredentials {
+  /** The SurrealDB root user name. Fixed, because it is not a secret. */
+  user: string;
+  /** The SurrealDB root password. */
+  password: string;
+  /** True when the fixed legacy password is in use. */
+  legacy: boolean;
+  /** Provenance of the resolved password. */
+  source: DatabaseCredentialSource;
+}
+
+/**
+ * The environment variables that carry database credentials to the SurrealDB
+ * server and the Python backend.
+ *
+ * SurrealDB's CLI reads `SURREAL_USER` and `SURREAL_PASS`; the upstream
+ * backend reads `SURREAL_USER` and `SURREAL_PASSWORD` and falls back to
+ * `SURREAL_PASS`. Both spellings are therefore populated with the same value.
+ *
+ * The credentials travel through the process environment rather than the
+ * command line so they never appear in a process listing.
+ */
+export interface CredentialEnvironment {
+  SURREAL_USER: string;
+  SURREAL_PASSWORD: string;
+  SURREAL_PASS: string;
+}
+
+/** The on-disk artifacts that hold the install's secrets. */
+export interface CredentialStoreLayout {
+  /** Directory holding the install's user data. */
+  dataDir: string;
+  /** Path of the obfuscated provider-API-key encryption key. */
+  encryptionKeyFile: string;
+  /** Path of the obfuscated SurrealDB root password store. */
+  secretsFile: string;
+}
+
+/** The outcome of a secret-storage operation. */
+export interface CredentialStoreResult {
+  /** The resolved value. */
+  value: string;
+  /** True when the value already existed on disk and was reused. */
+  persisted: boolean;
+  /** True when the stored bytes do not contain the secret in plaintext. */
+  obfuscatedAtRest: boolean;
+  /** True when the file ACL was successfully restricted to the current user. */
+  aclRestricted: boolean;
 }
 
 // ============================================================================

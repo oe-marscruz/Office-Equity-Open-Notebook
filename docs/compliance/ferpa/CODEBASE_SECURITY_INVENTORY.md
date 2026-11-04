@@ -15,13 +15,13 @@ Before verification, `resources/runtime/` was absent. The upstream-lock test gen
 | Component or boundary | Owning source | What source establishes | Missing evidence |
 | --- | --- | --- | --- |
 | Primary desktop host | `src-tauri/src/main.rs`, `runner.rs` | Starts local database, API, worker, static server and proxy | Successful native build, installed-app execution, authenticated backend behavior |
-| Retained JavaScript launcher | `main.js`, `scripts/start-services.js` | Builds child environment; launches local services; stores files beneath user data directory | Actual runtime smoke test, secret-store and migration verification |
-| Database | `scripts/start-services.js`, `src-tauri/src/runner.rs` | SurrealDB is configured on loopback with fixed `root/root` credentials | Nondefault credentials, least privilege, existing-database credential migration, storage encryption |
+| Retained JavaScript launcher | `main.js`, `scripts/start-services.js` | Builds child environment; launches local services; stores files beneath user data directory. Database credentials are resolved by the shared credential store and passed to children through the process environment, never on a command line | Actual runtime smoke test; secret-store backup/restore and key-rotation verification |
+| Database | `scripts/lib/credentials.js`, `scripts/start-services.js`, `src-tauri/src/runner.rs`, `src-wails/runner.go`, `src-winui/ServiceManager.cs` | SurrealDB is configured on loopback. Fresh installs receive a per-install random root password stored obfuscated and ACL-restricted to the current OS user; datastores created by older builds keep their original `root` password until an operator rotates it, because SurrealDB applies initial root credentials only to a new datastore | Least privilege beyond the fixed `root` account; operator-driven rotation of a legacy password; datastore storage encryption at rest |
 | Local API and worker | `scripts/start-services.js`, `src-tauri/src/runner.rs` | Python service startup commands and loopback API configuration | Pinned backend source, object authorization, session enforcement, consent and disclosure rules |
 | API proxy and static server | `src-tauri/src/server.rs`, `proxy.rs`, `static_server.rs` | Native listener binds loopback; proxy forwards requests | Host/Origin and request authorization guards; enforced streamed-body bounds; runtime traversal and streaming tests |
 | Browser boundary | `src-tauri/src/security.rs`, `src-tauri/tauri.conf.json`, `main.js` | Navigation rules exist; Tauri CSP is null | Active CSP, exact-origin checks in all hosts, external-link and malicious-navigation runtime tests |
 | Service diagnostics | `scripts/service-diagnostics.js`, `src-tauri/src/service_diagnostics.rs` | Child stdout/stderr were written to logs and console without invoking the sample redactor; F03 now discards them at the OS boundary and writes `<service>.lifecycle.jsonl` with generated timestamps, fixed identifiers and numeric exit status only | Data minimization at every sink; synthetic record and credential leak tests |
-| Local encryption key | `main.js:26` | A generated key is stored in `encryption-key.txt` | OS-protected key storage, rotation, migration and recovery; data encryption coverage is unknown |
+| Local encryption key | `scripts/lib/credentials.js`, `main.js` | A generated key is stored in `encryption-key.txt` obfuscated with a user-and-machine-bound derivation and restricted to the current OS user; legacy plaintext key files remain readable | Rotation, migration and recovery; data encryption coverage is unknown |
 | Model providers and other egress | Backend assembled by `scripts/prepare-runtime.js` | Provider calls are outside the available backend source | Actual destinations, approved vendors, default-deny policy, consent/exception decisions, request and retry tests |
 | Cloud infrastructure | No Azure deployment or IaC identified in source review | This checkout does not establish a cloud deployment | Approved hosting model, tenant and region; identity, networking, key, storage and logging configuration |
 
@@ -46,6 +46,20 @@ The baseline observations above describe the original source. On `codex/ferpa-se
 The native baseline `cargo check --offline --manifest-path src-tauri/Cargo.toml` had failed before this work: Tauri context generation lacked build-script output, the navigation policy used an unsupported `Window.on_navigation` method, and the old Tokio child-handle call was invalid. Upstream `70e0ae4` has since repaired all three, so the native check passes on the ported branch and F03 uses the tested standard-library child handle. Installed-app acceptance is still open. See [SERVICE_DIAGNOSTICS_HANDOFF.md](SERVICE_DIAGNOSTICS_HANDOFF.md).
 
 The selected target scope is now all three configurations: fully local desktop, desktop with approved cloud AI and an Azure-hosted backend. Their mode-specific controls and tenant evidence remain open in the implementation queue.
+
+## Per-install credential store re-port
+
+The fixed `root`/`root` SurrealDB credential on a loopback-bound service was not a defense: any other process on the machine could reach the local port and read the whole notebook database. This re-port replaces it with a per-install random password and a shared on-disk secret store implemented identically by all five hosts.
+
+`scripts/lib/credentials.js` is the canonical implementation. `src/contracts/credentials.ts` is a typed facade over it. The Rust (`src-tauri/src/credentials.rs`), Go (`src-wails/credentials.go`) and C# (`src-winui/Credentials.cs`) hosts implement the same on-disk format natively. `tests/contracts/credentials-cases.json` pins the shared derivation and obfuscation vectors so the five implementations cannot drift, and `scripts/tests/test-credentials.js` asserts the JavaScript host against that fixture plus the launcher wiring.
+
+The on-disk format is byte-for-byte identical across hosts: `encryption-key.txt` holds the obfuscated key as `obf:` plus base64, and `secrets.json` holds `{"surrealPassword": "<obf:...>"}` with two-space indentation and a trailing newline. The obfuscation key is `SHA-256("Office-Equity-Open-Notebook|<username>|<hostname>")`, with the domain qualifier stripped from the account name so the Windows API, Go and Node account lookups agree.
+
+Credentials reach SurrealDB and the Python backend through `SURREAL_USER`, `SURREAL_PASSWORD` and `SURREAL_PASS` in the child process environment, so they never appear in a process listing. The `--user` and `--pass` command-line flags were removed from the SurrealDB launch arguments in every host.
+
+Existing datastores keep their original `root` password. SurrealDB creates the root user from the initial credentials only when the datastore is new, so a freshly generated password would have had no effect on an upgraded install and would have locked the backend out of its own data. Rotating a legacy password remains an open operator task.
+
+This is deliberately not presented as equivalent to a hardware-backed key store. It raises the bar against casual reads by other processes and avoids the plaintext-secret-file pattern that endpoint-protection software flags. It does not defend against an attacker who already runs as the current OS user.
 
 ## Source guidance and interpretation
 

@@ -13,6 +13,10 @@
 
 const { execFileSync } = require('child_process');
 const { spawnServiceProcess } = require('./service-diagnostics');
+const {
+  buildCredentialEnvironment,
+  resolveDatabaseCredentials,
+} = require('./lib/credentials');
 const net = require('net');
 const http = require('http');
 const path = require('path');
@@ -165,6 +169,9 @@ async function waitForServiceReady(port, url, timeoutMs = 60000, label = String(
  * @param {string} cfg.dataDir      Directory for user data (db, uploads, logs).
  * @param {string} cfg.encryptionKey OPEN_NOTEBOOK_ENCRYPTION_KEY value.
  * @param {boolean} cfg.waitReady   Wait for the frontend to be reachable.
+ * @param {{ user: string, password: string }} [cfg.credentials]
+ *   Resolved SurrealDB credentials. When omitted, they are resolved from the
+ *   install's secret store so the services never start with a fixed password.
  */
 async function startServices(cfg) {
   const { runtimePath, dataDir, encryptionKey } = cfg;
@@ -213,6 +220,13 @@ async function startServices(cfg) {
   const dataFolder = path.join(dataDir, 'data');
   fs.mkdirSync(dataFolder, { recursive: true });
 
+  // The database credentials come from the install's secret store, so every
+  // install has its own random password instead of a fixed `root`/`root`.
+  // They travel through the process environment rather than the command line
+  // so they never appear in a process listing.
+  const credentials = cfg.credentials || resolveDatabaseCredentials(dataDir);
+  const credentialEnv = buildCredentialEnvironment(credentials);
+
   const backendEnv = {
     ...process.env,
     PYTHONPATH: backendPath,
@@ -220,8 +234,7 @@ async function startServices(cfg) {
     PYTHONUTF8: '1',
     DATA_FOLDER: dataFolder,
     SURREAL_URL: 'ws://127.0.0.1:8000/rpc',
-    SURREAL_USER: 'root',
-    SURREAL_PASSWORD: 'root',
+    ...credentialEnv,
     SURREAL_NAMESPACE: 'open_notebook',
     SURREAL_DATABASE: 'open_notebook',
     OPEN_NOTEBOOK_ENCRYPTION_KEY: encryptionKey,
@@ -249,7 +262,7 @@ async function startServices(cfg) {
   spawnService(
     'surrealdb',
     surrealExe,
-    ['start', '--log', 'info', '--user', 'root', '--pass', 'root', '--bind', `127.0.0.1:${PORTS.surreal}`, `rocksdb:${surrealDbFile}`],
+    ['start', '--log', 'info', '--bind', `127.0.0.1:${PORTS.surreal}`, `rocksdb:${surrealDbFile}`],
     { cwd: dataDir, env: backendEnv }
   );
   await waitForServiceReady(PORTS.surreal, `http://127.0.0.1:${PORTS.surreal}/health`, 60000, 'SurrealDB');

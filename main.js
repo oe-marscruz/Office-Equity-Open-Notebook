@@ -11,8 +11,11 @@
 const { app, BrowserWindow, shell, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const crypto = require('crypto');
 const { startServices } = require('./scripts/start-services');
+const {
+  ensureEncryptionKey,
+  resolveDatabaseCredentials,
+} = require('./scripts/lib/credentials');
 
 const FRONTEND_URL = 'http://127.0.0.1:8502';
 
@@ -21,17 +24,6 @@ function resolveRuntimePath() {
     return path.join(process.resourcesPath, 'runtime');
   }
   return path.join(__dirname, 'resources', 'runtime');
-}
-
-function ensureEncryptionKey(dataDir) {
-  const keyFile = path.join(dataDir, 'encryption-key.txt');
-  if (fs.existsSync(keyFile)) {
-    return fs.readFileSync(keyFile, 'utf8').trim();
-  }
-  const key = crypto.randomBytes(32).toString('hex');
-  fs.mkdirSync(dataDir, { recursive: true });
-  fs.writeFileSync(keyFile, key, 'utf8');
-  return key;
 }
 
 let services = null;
@@ -101,6 +93,7 @@ app.whenReady().then(async () => {
   const runtimePath = resolveRuntimePath();
   const dataDir = app.getPath('userData');
   const encryptionKey = ensureEncryptionKey(dataDir);
+  const credentials = resolveDatabaseCredentials(dataDir);
 
   const required = [
     path.join(runtimePath, 'surreal', 'surreal.exe'),
@@ -121,6 +114,7 @@ app.whenReady().then(async () => {
       runtimePath,
       dataDir,
       encryptionKey,
+      credentials,
       waitReady: true,
     });
   } catch (err) {

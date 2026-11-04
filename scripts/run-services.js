@@ -10,9 +10,8 @@
  */
 
 const path = require('path');
-const fs = require('fs');
-const crypto = require('crypto');
 const { startServices } = require('./start-services');
+const { ensureEncryptionKey } = require('./lib/credentials');
 
 function arg(name, def) {
   const i = process.argv.indexOf(name);
@@ -23,16 +22,7 @@ function arg(name, def) {
 async function main() {
   const runtime = arg('--runtime', path.join(__dirname, '..', 'resources', 'runtime'));
   const data = arg('--data', path.join(__dirname, '..', 'resources', '.testdata'));
-  const key =
-    arg('--key', null) ||
-    (() => {
-      const kf = path.join(data, 'encryption-key.txt');
-      if (fs.existsSync(kf)) return fs.readFileSync(kf, 'utf8').trim();
-      const k = crypto.randomBytes(32).toString('hex');
-      fs.mkdirSync(data, { recursive: true });
-      fs.writeFileSync(kf, k);
-      return k;
-    })();
+  const key = arg('--key', null) || ensureEncryptionKey(data);
 
   console.log('Starting services...');
   const services = await startServices({ runtimePath: runtime, dataDir: data, encryptionKey: key, waitReady: true });

@@ -126,14 +126,34 @@ namespace OfficeEquityOpenNotebook
             string surrealDbFile = Path.Combine(DataDir, "surrealdb", "mydatabase.db");
             Directory.CreateDirectory(Path.GetDirectoryName(surrealDbFile)!);
 
+            // Resolve the per-install database credentials and the provider-API-key
+            // encryption key. The credentials travel through the child environment
+            // rather than the command line so they never appear in a process listing.
+            DatabaseCredentials credentials = Credentials.ResolveDatabaseCredentials(DataDir);
+            CredentialEnvironment credentialEnv = Credentials.BuildCredentialEnvironment(credentials);
+            string encryptionKey = Credentials.EnsureEncryptionKey(DataDir);
+
+            var backendEnv = new Dictionary<string, string>
+            {
+                ["OPEN_NOTEBOOK_ENCRYPTION_KEY"] = encryptionKey,
+                ["SURREAL_URL"] = "ws://127.0.0.1:8000/rpc",
+                ["SURREAL_NAMESPACE"] = "open_notebook",
+                ["SURREAL_DATABASE"] = "open_notebook",
+            };
+            foreach (var pair in credentialEnv.AsPairs())
+            {
+                backendEnv[pair.Key] = pair.Value;
+            }
+
             var configs = new List<ServiceConfig>
             {
                 new ServiceConfig
                 {
                     Name = "surrealdb",
                     Executable = Path.Combine(RuntimePath, "surreal", "surreal.exe"),
-                    Args = new List<string> { "start", "--log", "info", "--user", "root", "--pass", "root", "--bind", "127.0.0.1:8000", $"rocksdb:{surrealDbFile}" },
+                    Args = new List<string> { "start", "--log", "info", "--bind", "127.0.0.1:8000", $"rocksdb:{surrealDbFile}" },
                     Cwd = RuntimePath,
+                    Env = backendEnv,
                     ReadinessPort = 8000,
                     TimeoutSec = 60
                 },
@@ -143,6 +163,7 @@ namespace OfficeEquityOpenNotebook
                     Executable = Path.Combine(RuntimePath, "python", "python.exe"),
                     Args = new List<string> { "-m", "uvicorn", "api.main:app", "--host", "127.0.0.1", "--port", "5055" },
                     Cwd = backendPath,
+                    Env = backendEnv,
                     ReadinessPort = 5055,
                     TimeoutSec = 120
                 },
@@ -152,6 +173,7 @@ namespace OfficeEquityOpenNotebook
                     Executable = Path.Combine(RuntimePath, "python", "python.exe"),
                     Args = new List<string> { "-m", "surreal_commands.cli.worker", "--import-modules", "commands", "--max-tasks", "2" },
                     Cwd = backendPath,
+                    Env = backendEnv,
                     ReadinessPort = 0, // Process liveness
                     TimeoutSec = 30
                 },

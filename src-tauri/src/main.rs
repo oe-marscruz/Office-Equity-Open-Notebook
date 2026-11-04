@@ -10,6 +10,7 @@ mod job_object;
 mod proxy;
 mod static_server;
 mod server;
+mod credentials;
 
 use runner::{resolve_runtime_path, check_missing_files, start_services};
 
