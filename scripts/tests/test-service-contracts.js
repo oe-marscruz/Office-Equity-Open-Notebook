@@ -58,6 +58,7 @@ function run() {
   // Test 4: Verify BackendEnvironment generator
   console.log('Test 4: createBackendEnvironment contract');
   const env = createBackendEnvironment({
+    credentials: { user: 'root', password: 'synthetic-test-password' },
     backendPath: '/test/backend',
     dataFolder: '/test/data',
     encryptionKey: 'test-key-123',
