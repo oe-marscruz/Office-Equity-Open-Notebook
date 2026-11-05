@@ -1,445 +1,239 @@
 'use strict';
 
-/**
- * lib/credentials.js — shared on-disk secret storage for every desktop host.
- *
- * The Electron launcher, the headless CLI, the Rust/Tauri host, the Go/Wails
- * host and the C#/WinUI host all need the same two secrets, in the same
- * format, so that a user data directory can be moved between hosts:
- *
- *   1. `encryption-key.txt` — the key that encrypts provider API keys.
- *   2. `secrets.json`       — the SurrealDB root password.
- *
- * This module is the canonical implementation. `src/contracts/credentials.ts`
- * is a typed facade over it, and the Rust, Go and C# hosts implement the same
- * on-disk format natively (see the cross-language notes on each format).
- *
- * Security model
- * --------------
- * A fixed `root`/`root` credential on a loopback-bound service is not a
- * defense: any other process or account on the machine can reach the local
- * port and read the whole notebook database. Each install therefore gets its
- * own randomly generated database password.
- *
- * Secrets are stored obfuscated (XOR with a machine-and-user-bound
- * derivation) rather than in plaintext, and the files are restricted to the
- * current OS user via ACLs. This is deliberately not presented as equivalent
- * to a hardware-backed key store; it raises the bar against casual reads by
- * other processes and avoids the plaintext-secret-file pattern that
- * endpoint-protection software flags. It does not defend against an attacker
- * who already runs as the current user.
- *
- * Legacy installs
- * ---------------
- * SurrealDB applies the initial root credentials *only when no root user
- * exists yet*. A datastore created by an older build already has a root user,
- * so a newly generated password has no effect and the backend would be locked
- * out of its own data. Existing datastores therefore keep their original
- * `root` password until the operator explicitly rotates it; only fresh
- * installs receive a random one.
- */
-
+// Shared storage format for the CLI/Electron hosts and the native implementations.
+// Obfuscation preserves compatibility; it does not replace an OS secret store.
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const os = require('os');
+const { isUtf8 } = require('node:buffer');
 const { execFileSync } = require('child_process');
 
-/** File holding the obfuscated provider-API-key encryption key. */
 const KEY_FILENAME = 'encryption-key.txt';
-/** File holding the obfuscated SurrealDB root password. */
 const SECRETS_FILENAME = 'secrets.json';
-/** The root password used by builds that predate per-install credentials. */
 const LEGACY_DATABASE_PASSWORD = 'root';
-/** The SurrealDB root username. Fixed, because it is not itself a secret. */
 const DATABASE_USER = 'root';
-
-/** Directory and file names of the SurrealDB datastore, relative to the data dir. */
 const DATABASE_DIRNAME = 'surrealdb';
 const DATABASE_FILENAME = 'mydatabase.db';
-
-/** Marker prefix identifying an obfuscated value in a secret file. */
 const OBFUSCATION_PREFIX = 'obf:';
-/** App-specific salt mixed into the obfuscation key derivation. */
 const OBFUSCATION_SALT = 'Office-Equity-Open-Notebook';
-
-/** Length in bytes of the generated encryption key. */
 const ENCRYPTION_KEY_BYTES = 32;
-/** Length in bytes of the generated database password. */
 const DATABASE_PASSWORD_BYTES = 24;
 
-/**
- * Strips a domain qualifier from an account name.
- *
- * Windows APIs disagree about whether the account name is domain-qualified:
- * `GetUserNameW` reports `cruzmars` while `user.Current()` in Go reports
- * `UNIVERSITY\cruzmars`. The obfuscation key has to be identical across all
- * five hosts, so the domain qualifier is removed everywhere.
- *
- * @param {unknown} name
- * @returns {string}
- */
+class CredentialError extends Error {
+  constructor(code) { super(code); this.code = code; }
+}
+function fail(code) { throw new CredentialError(code); }
 function stripUserDomain(name) {
   const raw = typeof name === 'string' ? name.trim() : '';
-  if (!raw) return '';
   const cut = Math.max(raw.lastIndexOf('\\'), raw.lastIndexOf('/'));
   return cut >= 0 ? raw.slice(cut + 1).trim() : raw;
 }
-
-/**
- * The current OS user name, or an empty string when it cannot be determined.
- *
- * The environment is consulted first because every host can read it, whereas
- * the OS account APIs differ in what they return (see `stripUserDomain`).
- * The order is fixed so that all five hosts resolve the same value:
- * `USERNAME`, then `USER`, then the OS account API.
- *
- * @returns {string}
- */
 function currentUsername() {
-  const fromEnv = stripUserDomain(process.env.USERNAME) || stripUserDomain(process.env.USER);
-  if (fromEnv) return fromEnv;
-  try {
-    const info = os.userInfo();
-    if (info) {
-      const fromApi = stripUserDomain(info.username);
-      if (fromApi) return fromApi;
-    }
-  } catch (_) {
-    // os.userInfo() can fail in restricted sandboxes; fall through.
-  }
-  return '';
+  const name = stripUserDomain(process.env.USERNAME) || stripUserDomain(process.env.USER);
+  if (name) return name;
+  try { return stripUserDomain(os.userInfo().username); } catch (_) { return ''; }
 }
-
-/**
- * The current machine name, or an empty string when it cannot be determined.
- *
- * The order is fixed so that all five hosts resolve the same value:
- * `COMPUTERNAME`, then `HOSTNAME`, then the OS API.
- *
- * @returns {string}
- */
 function currentHostname() {
-  const fromEnv =
-    typeof process.env.COMPUTERNAME === 'string' ? process.env.COMPUTERNAME.trim() : '';
-  if (fromEnv) return fromEnv;
-  const hostEnv = typeof process.env.HOSTNAME === 'string' ? process.env.HOSTNAME.trim() : '';
-  if (hostEnv) return hostEnv;
-  try {
-    const name = os.hostname();
-    if (typeof name === 'string' && name.trim()) return name.trim();
-  } catch (_) {
-    // os.hostname() can fail in restricted sandboxes; fall through.
-  }
-  return '';
+  return (process.env.COMPUTERNAME || process.env.HOSTNAME || os.hostname()).trim();
 }
-
-/**
- * Derives the obfuscation key for secret files.
- *
- * The key is the SHA-256 of a fixed app salt, the current OS user name and
- * the machine name, joined by `|`. Tying the derivation to both the account
- * and the machine means a copied secret file does not decode elsewhere.
- *
- * The exact derivation string is part of the cross-language on-disk contract
- * and must stay byte-for-byte identical in the Rust, Go and C# hosts:
- *
- *     SHA-256("Office-Equity-Open-Notebook|<username>|<hostname>")
- *
- * @returns {Buffer} A 32-byte obfuscation key.
- */
-function deriveObfuscationKey() {
-  return deriveObfuscationKeyFrom(currentUsername(), currentHostname());
-}
-
-/**
- * Derives the obfuscation key for an explicit account and machine name.
- *
- * Exposed so that the cross-language parity tests can check a fixed vector
- * instead of depending on the machine the tests happen to run on.
- *
- * @param {string} username
- * @param {string} hostname
- * @returns {Buffer} A 32-byte obfuscation key.
- */
 function deriveObfuscationKeyFrom(username, hostname) {
-  const parts = [OBFUSCATION_SALT, username || '', hostname || ''];
-  return crypto.createHash('sha256').update(parts.join('|'), 'utf8').digest();
+  return crypto.createHash('sha256').update([OBFUSCATION_SALT, username || '', hostname || ''].join('|'), 'utf8').digest();
 }
-
-/**
- * XOR-obfuscates data with the machine-bound key. The transform is symmetric:
- * applying it twice restores the original bytes.
- *
- * @param {Buffer|string} data
- * @param {Buffer} key
- * @returns {Buffer}
- */
+function deriveObfuscationKey() {
+  const username = currentUsername(), hostname = currentHostname();
+  if (!username || !hostname) fail('CREDENTIAL_STORE_UNAVAILABLE');
+  return deriveObfuscationKeyFrom(username, hostname);
+}
 function xorObfuscate(data, key) {
   const buf = Buffer.isBuffer(data) ? data : Buffer.from(data, 'utf8');
   const out = Buffer.alloc(buf.length);
-  for (let i = 0; i < buf.length; i++) {
-    out[i] = buf[i] ^ key[i % key.length];
-  }
+  for (let i = 0; i < buf.length; i++) out[i] = buf[i] ^ key[i % key.length];
   return out;
 }
-
-/**
- * Restricts a file to the current OS user.
- *
- * These files hold the key that protects stored provider API keys and the
- * database root password. `writeFileSync` inherits the parent directory's
- * permissions, which on Windows means other accounts on a shared machine can
- * read them. `icacls` is the supported way to drop the inherited entries.
- *
- * This is best effort by design: a failure here must never stop the app from
- * starting, so every error is swallowed.
- *
- * @param {string} file
- * @returns {boolean} True when the ACL was applied.
- */
-function restrictToCurrentUser(file) {
-  if (process.platform !== 'win32') {
-    try {
-      fs.chmodSync(file, 0o600);
-      return true;
-    } catch (_) {
-      // Best effort: a failure here must not stop the app from starting.
-      return false;
-    }
+function validSecret(value) {
+  return typeof value === 'string' && value.length > 0 && !/[\x00-\x1f\x7f]/.test(value);
+}
+function encodeSecret(secret) {
+  if (!validSecret(secret)) fail('CREDENTIALS_INVALID');
+  return OBFUSCATION_PREFIX + xorObfuscate(secret, deriveObfuscationKey()).toString('base64');
+}
+function decodeSecret(stored) {
+  if (typeof stored !== 'string') fail('CREDENTIAL_RECOVERY_REQUIRED');
+  const raw = stored.trim();
+  let secret = raw;
+  if (raw.startsWith(OBFUSCATION_PREFIX)) {
+    const payload = raw.slice(OBFUSCATION_PREFIX.length);
+    const bytes = Buffer.from(payload, 'base64');
+    if (!payload || bytes.toString('base64') !== payload) fail('CREDENTIAL_RECOVERY_REQUIRED');
+    const decoded = xorObfuscate(bytes, deriveObfuscationKey());
+    if (!isUtf8(decoded)) fail('CREDENTIAL_RECOVERY_REQUIRED');
+    secret = decoded.toString('utf8');
   }
+  if (!validSecret(secret)) fail('CREDENTIAL_RECOVERY_REQUIRED');
+  return secret;
+}
+
+// Keep the script fixed. File paths travel as an environment value, never shell code.
+const ACL_SCRIPT = [
+  '$ErrorActionPreference = "Stop"',
+  '$p = $env:OE_CREDENTIAL_ACL_FILE',
+  '$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User',
+  '$acl = [System.Security.AccessControl.FileSecurity]::new()',
+  '$acl.SetOwner($sid)',
+  '$acl.SetAccessRuleProtection($true, $false)',
+  '$rule = [System.Security.AccessControl.FileSystemAccessRule]::new($sid, [System.Security.AccessControl.FileSystemRights]::FullControl, [System.Security.AccessControl.AccessControlType]::Allow)',
+  '$acl.AddAccessRule($rule)',
+  '[System.IO.File]::SetAccessControl($p, $acl)',
+  '$actual = [System.IO.File]::GetAccessControl($p)',
+  '$rules = @($actual.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))',
+  'if (-not $actual.AreAccessRulesProtected -or $actual.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value -or $rules.Count -ne 1 -or $rules[0].IdentityReference.Value -ne $sid.Value -or $rules[0].IsInherited -or $rules[0].AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or $rules[0].FileSystemRights -ne [System.Security.AccessControl.FileSystemRights]::FullControl) { exit 1 }',
+].join('; ');
+
+function restrictToCurrentUser(file) {
   try {
-    const user = process.env.USERNAME;
-    if (!user) return false;
-    execFileSync('icacls', [file, '/inheritance:r', '/grant:r', `${user}:F`], {
-      stdio: 'ignore',
-      windowsHide: true,
+    const st = fs.lstatSync(file);
+    if (!st.isFile() || st.isSymbolicLink()) return false;
+    if (process.platform !== 'win32') {
+      fs.chmodSync(file, 0o600);
+      const actual = fs.statSync(file);
+      return (actual.mode & 0o777) === 0o600 && actual.uid === process.getuid();
+    }
+    const powershell = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32/WindowsPowerShell/v1.0/powershell.exe');
+    execFileSync(powershell, ['-NoProfile', '-NonInteractive', '-Command', ACL_SCRIPT], {
+      stdio: 'ignore', windowsHide: true, timeout: 15000,
+      env: { ...process.env, OE_CREDENTIAL_ACL_FILE: file },
     });
     return true;
-  } catch (_) {
-    // Best effort: the file exists, so the app still works even if the ACL
-    // could not be tightened.
-    return false;
-  }
+  } catch (_) { return false; }
 }
 
-/**
- * Writes `contents` to `file` and restricts it to the current OS user.
- *
- * @param {string} file
- * @param {string} contents
- */
-function writeSecretFile(file, contents) {
-  fs.writeFileSync(file, contents, 'utf8');
-  restrictToCurrentUser(file);
-}
+// Dependencies are injected only by fixture tests; launchers use the default store.
+function createCredentialStore(options = {}) {
+  const io = options.fs || fs;
+  const randomBytes = options.randomBytes || ((size) => crypto.randomBytes(size));
+  const restrict = options.restrict || restrictToCurrentUser;
 
-/**
- * Obfuscates a secret and encodes it for storage.
- *
- * @param {string} secret
- * @returns {string} `obf:` followed by base64 of the obfuscated bytes.
- */
-function encodeSecret(secret) {
-  const obfuscated = xorObfuscate(secret, deriveObfuscationKey());
-  return `${OBFUSCATION_PREFIX}${obfuscated.toString('base64')}`;
-}
-
-/**
- * Decodes a stored secret value.
- *
- * Values written before the obfuscated format existed are stored in plaintext
- * and are returned unchanged, so existing installs keep working.
- *
- * @param {string} stored
- * @returns {string}
- */
-function decodeSecret(stored) {
-  const raw = String(stored).trim();
-  if (!raw.startsWith(OBFUSCATION_PREFIX)) {
-    return raw;
-  }
-  const obfuscated = Buffer.from(raw.slice(OBFUSCATION_PREFIX.length), 'base64');
-  return xorObfuscate(obfuscated, deriveObfuscationKey()).toString('utf8');
-}
-
-/**
- * Writes the encryption key, obfuscated, to `file`.
- *
- * @param {string} file
- * @param {string} key
- */
-function writeEncryptionKeyFile(file, key) {
-  writeSecretFile(file, encodeSecret(key));
-}
-
-/**
- * Reads the encryption key from `file`.
- *
- * @param {string} file
- * @returns {string}
- */
-function readEncryptionKeyFile(file) {
-  return decodeSecret(fs.readFileSync(file, 'utf8'));
-}
-
-/**
- * True when `dataDir` already holds a SurrealDB datastore from an earlier run.
- *
- * RocksDB stores its datastore in a directory, which reports a size of 0 on
- * Windows, so both shapes have to be checked.
- *
- * @param {string} dataDir
- * @returns {boolean}
- */
-function hasExistingDatastore(dataDir) {
-  const file = path.join(dataDir, DATABASE_DIRNAME, DATABASE_FILENAME);
-  try {
-    const st = fs.statSync(file);
-    if (st.isDirectory()) {
-      return fs.readdirSync(file).length > 0;
+  function entry(file) {
+    try {
+      const st = io.lstatSync(file);
+      if (st.isSymbolicLink() || (!st.isFile() && !st.isDirectory())) fail('CREDENTIAL_RECOVERY_REQUIRED');
+      return st;
+    } catch (error) {
+      if (error && error.code === 'ENOENT') return null;
+      if (error instanceof CredentialError) throw error;
+      fail('CREDENTIAL_STORE_UNAVAILABLE');
     }
-    return st.size > 0;
-  } catch (_) {
-    return false;
   }
-}
-
-/**
- * Returns the persisted database password for `dataDir`, generating one on
- * first use.
- *
- * @param {string} dataDir
- * @returns {string}
- */
-function ensureDatabasePassword(dataDir) {
-  const secretsFile = path.join(dataDir, SECRETS_FILENAME);
-  try {
-    if (fs.existsSync(secretsFile)) {
-      const parsed = JSON.parse(fs.readFileSync(secretsFile, 'utf8'));
-      if (parsed && typeof parsed.surrealPassword === 'string' && parsed.surrealPassword.length > 0) {
-        return decodeSecret(parsed.surrealPassword);
-      }
+  function hasExistingDatastore(dataDir) {
+    // Even an empty or partially initialized store cannot safely be assumed fresh.
+    return entry(path.join(dataDir, DATABASE_DIRNAME, DATABASE_FILENAME)) !== null;
+  }
+  function readSecretFile(file) {
+    const st = entry(file);
+    if (!st) return null;
+    if (!st.isFile()) fail('CREDENTIAL_RECOVERY_REQUIRED');
+    if (!restrict(file)) fail('CREDENTIAL_STORE_UNAVAILABLE');
+    try {
+      const bytes = io.readFileSync(file);
+      if (!isUtf8(bytes)) fail('CREDENTIAL_RECOVERY_REQUIRED');
+      return bytes.toString('utf8');
+    } catch (error) {
+      if (error instanceof CredentialError) throw error;
+      fail('CREDENTIAL_STORE_UNAVAILABLE');
     }
-  } catch (_) {
-    // A corrupt secrets file is rewritten below rather than crashing startup.
   }
-  const surrealPassword = crypto.randomBytes(DATABASE_PASSWORD_BYTES).toString('base64url');
-  fs.mkdirSync(dataDir, { recursive: true });
-  writeSecretFile(
-    secretsFile,
-    `${JSON.stringify({ surrealPassword: encodeSecret(surrealPassword) }, null, 2)}\n`
-  );
-  return surrealPassword;
+  function writeSecretFile(file, contents) {
+    let fd;
+    try {
+      fd = io.openSync(file, 'wx', 0o600);
+      // No secret bytes are written until protection succeeds.
+      if (!restrict(file)) fail('CREDENTIAL_STORE_UNAVAILABLE');
+      io.writeFileSync(fd, contents, 'utf8');
+      io.fsyncSync(fd);
+      io.closeSync(fd);
+      fd = undefined;
+    } catch (error) {
+      if (fd !== undefined) { try { io.closeSync(fd); } catch (_) {} }
+      // Preserve a failed reservation for recovery rather than overwriting it later.
+      if (error instanceof CredentialError) throw error;
+      fail(error && error.code === 'EEXIST' ? 'CREDENTIAL_RECOVERY_REQUIRED' : 'CREDENTIAL_STORE_UNAVAILABLE');
+    }
+  }
+  function randomSecret(size, encoding) {
+    try {
+      const bytes = randomBytes(size);
+      if (!Buffer.isBuffer(bytes) || bytes.length !== size) fail('CREDENTIAL_RANDOMNESS_UNAVAILABLE');
+      return bytes.toString(encoding);
+    } catch (_) { fail('CREDENTIAL_RANDOMNESS_UNAVAILABLE'); }
+  }
+  function makeDirectory(dir) {
+    try { io.mkdirSync(dir, { recursive: true }); } catch (_) { fail('CREDENTIAL_STORE_UNAVAILABLE'); }
+  }
+  function ensureDatabasePassword(dataDir) {
+    const file = path.join(dataDir, SECRETS_FILENAME);
+    const stored = readSecretFile(file);
+    if (stored !== null) {
+      let parsed;
+      try { parsed = JSON.parse(stored); } catch (_) { fail('CREDENTIAL_RECOVERY_REQUIRED'); }
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) fail('CREDENTIAL_RECOVERY_REQUIRED');
+      return decodeSecret(parsed.surrealPassword);
+    }
+    if (hasExistingDatastore(dataDir)) fail('CREDENTIAL_RECOVERY_REQUIRED');
+    const password = randomSecret(DATABASE_PASSWORD_BYTES, 'base64url');
+    makeDirectory(dataDir);
+    writeSecretFile(file, JSON.stringify({ surrealPassword: encodeSecret(password) }, null, 2) + '\n');
+    return password;
+  }
+  function resolveDatabaseCredentials(dataDir) {
+    const hadSecrets = entry(path.join(dataDir, SECRETS_FILENAME)) !== null;
+    const password = ensureDatabasePassword(dataDir);
+    return { user: DATABASE_USER, password, legacy: false, source: hadSecrets ? 'stored' : 'generated' };
+  }
+  function writeEncryptionKeyFile(file, key) { writeSecretFile(file, encodeSecret(key)); }
+  function readEncryptionKeyFile(file) {
+    const stored = readSecretFile(file);
+    if (stored === null) fail('CREDENTIAL_RECOVERY_REQUIRED');
+    return decodeSecret(stored);
+  }
+  function ensureEncryptionKey(dataDir) {
+    const file = path.join(dataDir, KEY_FILENAME);
+    const stored = readSecretFile(file);
+    if (stored !== null) return decodeSecret(stored);
+    if (hasExistingDatastore(dataDir)) fail('CREDENTIAL_RECOVERY_REQUIRED');
+    const key = randomSecret(ENCRYPTION_KEY_BYTES, 'hex');
+    makeDirectory(dataDir);
+    writeEncryptionKeyFile(file, key);
+    return key;
+  }
+  return { ensureDatabasePassword, resolveDatabaseCredentials, ensureEncryptionKey,
+    hasExistingDatastore, writeSecretFile, writeEncryptionKeyFile, readEncryptionKeyFile };
 }
 
-/**
- * Resolves the SurrealDB credentials to start the database with.
- *
- * SurrealDB applies the initial root credentials only when no root user
- * exists yet, so a freshly generated password has no effect on a datastore
- * created by an older build: the stored root credentials win and the backend
- * would be locked out of its own data. Existing datastores therefore keep
- * their original password so upgrades never lose notebook content; only new
- * installs get a random one.
- *
- * @param {string} dataDir
- * @returns {{ user: string, password: string, legacy: boolean, source: 'legacy' | 'generated' | 'stored' }}
- */
-function resolveDatabaseCredentials(dataDir) {
-  const secretsFile = path.join(dataDir, SECRETS_FILENAME);
-  const hadSecrets = fs.existsSync(secretsFile);
-  if (hasExistingDatastore(dataDir) && !hadSecrets) {
-    return {
-      user: DATABASE_USER,
-      password: LEGACY_DATABASE_PASSWORD,
-      legacy: true,
-      source: 'legacy',
-    };
+function credentialStartupMessage(error) {
+  switch (error && error.code) {
+    case 'CREDENTIAL_RECOVERY_REQUIRED':
+      return "CREDENTIAL_RECOVERY_REQUIRED: Restore this installation's original credential files from a trusted backup, or contact your administrator. Notebook data has been preserved.";
+    case 'CREDENTIAL_STORE_UNAVAILABLE':
+      return 'CREDENTIAL_STORE_UNAVAILABLE: The app could not protect, read or save its credentials. Check access to the app data folder or contact your administrator.';
+    case 'CREDENTIAL_RANDOMNESS_UNAVAILABLE':
+      return 'CREDENTIAL_RANDOMNESS_UNAVAILABLE: Secure credential generation failed. Restart the app or contact your administrator.';
+    case 'CREDENTIALS_INVALID':
+      return 'CREDENTIALS_INVALID: Valid database credentials are required before services can start.';
+    default:
+      return 'SERVICE_STARTUP_FAILED: Review the service lifecycle diagnostics.';
   }
-  const password = ensureDatabasePassword(dataDir);
-  return {
-    user: DATABASE_USER,
-    password,
-    legacy: false,
-    source: hadSecrets ? 'stored' : 'generated',
-  };
 }
 
-/**
- * Returns the persisted encryption key for `dataDir`, generating a random
- * 32-byte key on first use.
- *
- * The key is stored obfuscated so it never appears in plaintext on disk.
- * Legacy plaintext key files are still readable, but new keys use the
- * obfuscated format.
- *
- * @param {string} dataDir Directory holding the app's user data.
- * @returns {string}
- */
-function ensureEncryptionKey(dataDir) {
-  const keyFile = path.join(dataDir, KEY_FILENAME);
-  if (fs.existsSync(keyFile)) {
-    const existing = readEncryptionKeyFile(keyFile);
-    if (existing) return existing;
-  }
-  const key = crypto.randomBytes(ENCRYPTION_KEY_BYTES).toString('hex');
-  fs.mkdirSync(dataDir, { recursive: true });
-  writeEncryptionKeyFile(keyFile, key);
-  return key;
-}
-
-/**
- * Builds the environment variables that carry the database credentials to the
- * SurrealDB server and the Python backend.
- *
- * SurrealDB's own CLI reads `SURREAL_USER` and `SURREAL_PASS`. The upstream
- * backend reads `SURREAL_USER` and `SURREAL_PASSWORD`, falling back to
- * `SURREAL_PASS`. Both are therefore set to the same value.
- *
- * The credentials are passed through the process environment rather than the
- * command line so they never appear in the process listing.
- *
- * @param {{ user: string, password: string }} credentials
- * @returns {{ SURREAL_USER: string, SURREAL_PASSWORD: string, SURREAL_PASS: string }}
- */
 function buildCredentialEnvironment(credentials) {
-  const user = credentials && credentials.user ? credentials.user : DATABASE_USER;
-  const password =
-    credentials && credentials.password ? credentials.password : LEGACY_DATABASE_PASSWORD;
-  return {
-    SURREAL_USER: user,
-    SURREAL_PASSWORD: password,
-    SURREAL_PASS: password,
-  };
+  if (!credentials || !validSecret(credentials.user) || !validSecret(credentials.password)) fail('CREDENTIALS_INVALID');
+  return { SURREAL_USER: credentials.user, SURREAL_PASSWORD: credentials.password, SURREAL_PASS: credentials.password };
 }
 
 module.exports = {
-  ensureEncryptionKey,
-  ensureDatabasePassword,
-  resolveDatabaseCredentials,
-  hasExistingDatastore,
-  restrictToCurrentUser,
-  buildCredentialEnvironment,
-  deriveObfuscationKey,
-  deriveObfuscationKeyFrom,
-  xorObfuscate,
-  encodeSecret,
-  decodeSecret,
-  writeSecretFile,
-  readEncryptionKeyFile,
-  writeEncryptionKeyFile,
-  stripUserDomain,
-  currentUsername,
-  currentHostname,
-  KEY_FILENAME,
-  SECRETS_FILENAME,
-  LEGACY_DATABASE_PASSWORD,
-  DATABASE_USER,
-  DATABASE_DIRNAME,
-  DATABASE_FILENAME,
-  OBFUSCATION_PREFIX,
-  OBFUSCATION_SALT,
-  ENCRYPTION_KEY_BYTES,
-  DATABASE_PASSWORD_BYTES,
+  ...createCredentialStore(), createCredentialStore, CredentialError, restrictToCurrentUser,
+  buildCredentialEnvironment, credentialStartupMessage, deriveObfuscationKey, deriveObfuscationKeyFrom,
+  xorObfuscate, encodeSecret, decodeSecret, stripUserDomain, currentUsername, currentHostname,
+  KEY_FILENAME, SECRETS_FILENAME, LEGACY_DATABASE_PASSWORD, DATABASE_USER, DATABASE_DIRNAME,
+  DATABASE_FILENAME, OBFUSCATION_PREFIX, OBFUSCATION_SALT, ENCRYPTION_KEY_BYTES, DATABASE_PASSWORD_BYTES,
 };

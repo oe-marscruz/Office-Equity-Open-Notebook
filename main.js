@@ -14,6 +14,7 @@ const fs = require('fs');
 const { startServices } = require('./scripts/start-services');
 const {
   ensureEncryptionKey,
+  credentialStartupMessage,
   resolveDatabaseCredentials,
 } = require('./scripts/lib/credentials');
 
@@ -123,8 +124,8 @@ app.whenReady().then(async () => {
   }
 
   createWindow();
-}).catch(() => {
-  showErrorAndExit('Office of Equity Open Notebook - failed to start', 'SERVICE_STARTUP_FAILED: Review the service lifecycle diagnostics.');
+}).catch((error) => {
+  showErrorAndExit('Office of Equity Open Notebook - failed to start', credentialStartupMessage(error));
 });
 
 app.on('window-all-closed', async () => {
