@@ -15,6 +15,7 @@
  */
 
 const fs = require('fs');
+const { assertRuntimeForPackaging } = require('./lib/runtime-evidence');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
@@ -47,7 +48,8 @@ function run(cmd, args, opts = {}) {
   return res;
 }
 
-function main() {
+async function main() {
+  await assertRuntimeForPackaging(RUNTIME_DIR, path.join(PROJECT_DIR, 'upstream.lock.json'));
   const outDir = arg('--out', path.join(PROJECT_DIR, 'out'));
   const appDir = path.join(outDir, PRODUCT_NAME);
 
@@ -121,4 +123,4 @@ function main() {
   console.log(`Run it directly, or build the installer with \`npm run installer\`.`);
 }
 
-main();
+main().catch((err) => { console.error(err.message); process.exitCode = 1; });
