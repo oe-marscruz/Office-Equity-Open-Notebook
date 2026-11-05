@@ -8,17 +8,20 @@
  * everything the desktop app needs to run offline:
  *
  *   runtime/
- *     python/        standalone CPython 3.12 with all backend dependencies
- *     backend/       the Open Notebook Python code (api, open_notebook, ...)
- *     frontend/      the built Next.js standalone server + static assets
- *     surreal/       the SurrealDB Windows binary
- *     node/          a portable Node.js runtime for the frontend server
- *     tiktoken-cache pre-downloaded tiktoken encoding (offline support)
+ *     python/        standalone CPython 3.12 with resolved backend packages
+ *     backend/       pinned, tracked Open Notebook Python source
+ *     frontend/      static frontend proof of concept (not an application)
+ *     surreal/       checksum-verified SurrealDB Windows binary
+ *     tiktoken-cache  pre-downloaded encoding
+ *     manifest.json  file hashes, source provenance and assembly limitations
+ *
+ * Full assembly currently fails acceptance because the frontend is a POC.
  *
  * Usage:
  *   node scripts/prepare-runtime.js [--repo <path>] [--step <name>]
+ *     [--runtime-dir <isolated-output>] [--lock-file <test-lock>]
  *
- * Steps: frontend | python | surreal | node | tiktoken | backend | all
+ * Steps: frontend | python | surreal | tiktoken | backend | all
  */
 
 const { spawnSync } = require('child_process');
@@ -30,7 +33,10 @@ const https = require('https');
 const http = require('http');
 
 const PROJECT_DIR = path.join(__dirname, '..');
-const RUNTIME_DIR = path.join(PROJECT_DIR, 'resources', 'runtime');
+const DEFAULT_RUNTIME_DIR = path.join(PROJECT_DIR, 'resources', 'runtime');
+let RUNTIME_DIR = DEFAULT_RUNTIME_DIR;
+const BUILD_DIRS = new Set();
+const { STEPS, writePreparationManifest } = require('./lib/runtime-evidence');
 const CACHE_DIR = path.join(PROJECT_DIR, 'resources', '.cache');
 const DEFAULT_REPO = path.join(PROJECT_DIR, '..', 'open-notebook');
 
@@ -132,8 +138,30 @@ function download(url, dest, expectedSha256) {
   });
 }
 
+function canonicalPath(input) {
+  let parent = path.resolve(input);
+  const suffix = [];
+  while (!fs.existsSync(parent)) {
+    const next = path.dirname(parent);
+    if (next === parent) throw new Error('Cannot resolve runtime output ancestry.');
+    suffix.unshift(path.basename(parent));
+    parent = next;
+  }
+  return path.join(fs.realpathSync(parent), ...suffix);
+}
+
+function containsPath(parent, candidate) {
+  const relative = path.relative(parent, candidate);
+  return !relative || (relative !== '..' && !relative.startsWith('..' + path.sep) && !path.isAbsolute(relative));
+}
+
 function rmrf(p) {
-  if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true });
+  const target = canonicalPath(p);
+  const relative = path.relative(RUNTIME_DIR, target);
+  if (!BUILD_DIRS.has(target) && (!relative || relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative))) {
+    throw new Error('Refusing to remove a directory outside this runtime build.');
+  }
+  if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true });
 }
 
 function findFile(dir, name) {
@@ -196,9 +224,8 @@ function buildPython(repo, options = {}) {
   // uv on Windows mishandles file arguments whose paths contain spaces (it
   // splits on the space), which breaks in directories like this one. Do the
   // install in a space-free temp directory, then copy the result into place.
-  const buildDir = path.join(os.tmpdir(), 'onb-uvbuild');
-  rmrf(buildDir);
-  fs.mkdirSync(buildDir, { recursive: true });
+  const buildDir = fs.mkdtempSync(path.join(os.tmpdir(), 'onb-uvbuild-'));
+  BUILD_DIRS.add(canonicalPath(buildDir));
   const reqFile = path.join(buildDir, 'requirements.txt');
   fs.writeFileSync(reqFile, deps.join('\n') + '\n', 'utf8');
 
@@ -275,6 +302,9 @@ async function buildSurreal() {
   if (!fs.existsSync(dest)) {
     await download(url, dest, CHECKSUMS.surreal);
   }
+  if (await sha256File(dest) !== CHECKSUMS.surreal) {
+    throw new Error('Checksum mismatch for cached SurrealDB binary.');
+  }
   log('surreal', `Saved SurrealDB binary to ${dest}`);
 }
 
@@ -297,9 +327,12 @@ function buildBackend(repo) {
   log('backend', 'Copying backend code');
   const dest = path.join(RUNTIME_DIR, 'backend');
   rmrf(dest);
-  for (const item of ['api', 'open_notebook', 'commands', 'prompts', 'LICENSE']) {
-    const src = path.join(repo, item);
-    if (fs.existsSync(src)) cp(src, path.join(dest, item));
+  // Copy only tracked source; ignored .env files and bytecode are not part of the pin.
+  const tracked = runCapture('git', ['ls-files', '-z', '--', 'api', 'open_notebook', 'commands', 'prompts', 'LICENSE'], { cwd: repo });
+  for (const rel of tracked.split('\0').filter(Boolean)) {
+    const src = path.join(repo, rel);
+    if (!fs.lstatSync(src).isFile()) throw new Error('Backend source contains a non-regular file.');
+    cp(src, path.join(dest, rel));
   }
 
   // Patch config.py so the data folder can be redirected via DATA_FOLDER env.
@@ -309,9 +342,10 @@ function buildBackend(repo) {
   // docs/1-INSTALLATION/windows-native.md.
   const configFile = path.join(dest, 'open_notebook', 'config.py');
   const config = fs.readFileSync(configFile, 'utf8');
+  if (!config.includes('DATA_FOLDER = "./data"')) throw new Error('Failed to patch config.py (DATA_FOLDER line not found)');
   const patched = config.replace(
     'DATA_FOLDER = "./data"',
-    'DATA_FOLDER = os.environ.get("DATA_FOLDER", "./data")'
+    (config.includes('import os') ? '' : 'import os\n') + 'DATA_FOLDER = os.environ.get("DATA_FOLDER", "./data")'
   );
   if (patched === config) {
     throw new Error('Failed to patch config.py (DATA_FOLDER line not found)');
@@ -327,54 +361,50 @@ function buildBackend(repo) {
 
 async function main() {
   const args = process.argv.slice(2);
-  const repo = readFlag(args, '--repo', DEFAULT_REPO);
+  const repoInput = path.resolve(readFlag(args, '--repo', DEFAULT_REPO));
+  if (!fs.existsSync(path.join(repoInput, 'pyproject.toml'))) {
+    throw new Error('Pinned upstream repository not found. Pass --repo with the approved local checkout.');
+  }
+  const repo = fs.realpathSync(repoInput);
   const step = readFlag(args, '--step', 'all');
   const overrideUpstreamCheck = args.includes('--override-upstream-check');
   const variant = readFlag(args, '--variant', args.includes('--no-docling') ? 'core' : 'full');
   const skipDocling = variant === 'core' || args.includes('--no-docling');
-
-  if (!fs.existsSync(path.join(repo, 'pyproject.toml'))) {
-    console.error(`Repository not found at ${repo}. Pass --repo=<path> or clone lfnovo/open-notebook.`);
-    process.exit(1);
+  RUNTIME_DIR = canonicalPath(readFlag(args, '--runtime-dir', DEFAULT_RUNTIME_DIR));
+  const lockFilePath = path.resolve(readFlag(args, '--lock-file', path.join(PROJECT_DIR, 'upstream.lock.json')));
+  if (!['all', ...STEPS].includes(step)) throw new Error('Unknown preparation step: ' + step);
+  if (!['full', 'core'].includes(variant) || (variant === 'full' && skipDocling)) {
+    throw new Error('Use --variant core for a runtime without Docling.');
   }
-
-  const lockFilePath = path.join(PROJECT_DIR, 'upstream.lock.json');
-  let lockData = null;
-  if (fs.existsSync(lockFilePath)) {
-    lockData = JSON.parse(fs.readFileSync(lockFilePath, 'utf8'));
+  // An alternate test lock must never generate an apparently approved default runtime.
+  if (lockFilePath !== path.join(PROJECT_DIR, 'upstream.lock.json') && RUNTIME_DIR === canonicalPath(DEFAULT_RUNTIME_DIR)) {
+    throw new Error('An alternate lock requires an isolated --runtime-dir.');
+  }
+  const project = fs.realpathSync(PROJECT_DIR);
+  const resources = canonicalPath(path.join(project, 'resources'));
+  if (containsPath(RUNTIME_DIR, project) || containsPath(RUNTIME_DIR, repo) ||
+      containsPath(repo, RUNTIME_DIR) ||
+      (containsPath(project, RUNTIME_DIR) && (RUNTIME_DIR === resources || !containsPath(resources, RUNTIME_DIR)))) {
+    throw new Error('Runtime output overlaps protected project or upstream source.');
+  }
+  const { validateRuntimeAllowlist } = require(path.join(PROJECT_DIR, 'dist/src/contracts/modular-packaging'));
+  const lockData = JSON.parse(fs.readFileSync(lockFilePath, 'utf8'));
+  const upstreamCommit = runCapture('git', ['rev-parse', 'HEAD'], { cwd: repo });
+  const upstreamPinMatched = /^[0-9a-f]{40}$/.test(lockData.commit || '') &&
+    !/^0+$/.test(lockData.commit) && upstreamCommit === lockData.commit;
+  const upstreamStatus = runCapture('git', ['status', '--porcelain', '--untracked-files=normal'], { cwd: repo });
+  const upstreamWorkingTreeClean = upstreamStatus === '';
+  if (!upstreamPinMatched || !upstreamWorkingTreeClean) {
+    if (!overrideUpstreamCheck) throw new Error('Upstream commit mismatch or dirty source; runtime preparation refused.');
+    console.warn('Upstream commit mismatch or dirty source overridden; output is ineligible for packaging.');
   } else {
-    console.warn(`Warning: upstream.lock.json not found.`);
+    console.log('Verified upstream commit: ' + upstreamCommit);
   }
 
-  let upstreamCommit = 'unknown';
-  try {
-    upstreamCommit = runCapture('git', ['rev-parse', 'HEAD'], { cwd: repo });
-    if (lockData && lockData.commit) {
-      if (upstreamCommit !== lockData.commit) {
-        if (overrideUpstreamCheck) {
-          console.warn(`\n⚠️  Upstream commit mismatch overridden! Expected ${lockData.commit}, got ${upstreamCommit}.`);
-        } else {
-          console.error(`\n❌ Upstream commit mismatch! Expected ${lockData.commit}, got ${upstreamCommit}.`);
-          console.error(`Pass --override-upstream-check to bypass this error.`);
-          process.exit(1);
-        }
-      } else {
-        console.log(`Verified upstream commit: ${upstreamCommit}`);
-      }
-    }
-  } catch (e) {
-    if (!overrideUpstreamCheck) {
-      console.error(`\n❌ Failed to determine upstream commit: ${e.message}`);
-      console.error(`Pass --override-upstream-check to bypass this error.`);
-      process.exit(1);
-    } else {
-      console.warn(`\n⚠️  Failed to determine upstream commit, overridden! (${e.message})`);
-    }
-  }
-
-  console.log(`Using repository: ${repo}`);
-  console.log(`Runtime output:  ${RUNTIME_DIR}`);
-  console.log(`Target variant:  ${variant}${skipDocling ? ' (no Docling)' : ''}`);
+  fs.mkdirSync(RUNTIME_DIR, { recursive: true });
+  // Invalidate a previous manifest before a step can change any artifact.
+  const manifestPath = path.join(RUNTIME_DIR, 'manifest.json');
+  if (fs.existsSync(manifestPath)) fs.unlinkSync(manifestPath);
 
   const steps = {
     frontend: () => buildFrontend(repo),
@@ -383,85 +413,57 @@ async function main() {
     tiktoken: () => buildTiktoken(),
     backend: () => buildBackend(repo),
   };
-
-  if (step === 'all') {
-    for (const key of Object.keys(steps)) {
-      await steps[key]();
-    }
-  } else {
-    if (!steps[step]) {
-      console.error(`Unknown step: ${step}. Valid: ${Object.keys(steps).join(', ')}, all`);
-      process.exit(1);
-    }
-    await steps[step]();
+  const completedSteps = [];
+  for (const name of step === 'all' ? STEPS : [step]) {
+    await steps[name]();
+    completedSteps.push(name);
   }
 
-  let wrapperCommit = 'unknown';
-  try {
-    wrapperCommit = runCapture('git', ['rev-parse', 'HEAD'], { cwd: PROJECT_DIR });
-  } catch (e) {}
-
-  // Run allowlist and modular packaging graph generation if built contracts are available
-  const modularPath = path.join(PROJECT_DIR, 'dist', 'src', 'contracts', 'modular-packaging.js');
-  let allowlistPassed = true;
-  let componentManifest = null;
-
-  if (fs.existsSync(modularPath)) {
-    try {
-      const { validateRuntimeAllowlist, generateModularPackagingGraph } = require(modularPath);
-      function walkDir(dir, baseDir = dir) {
-        let results = [];
-        if (!fs.existsSync(dir)) return results;
-        const entries = fs.readdirSync(dir, { withFileTypes: true });
-        for (const entry of entries) {
-          const full = path.join(dir, entry.name);
-          const rel = path.relative(baseDir, full).replace(/\\/g, '/');
-          if (entry.isDirectory()) {
-            results = results.concat(walkDir(full, baseDir));
-          } else if (entry.isFile()) {
-            const stat = fs.statSync(full);
-            results.push({ relPath: rel, sizeBytes: stat.size });
-          }
-        }
-        return results;
-      }
-
-      const allFiles = walkDir(RUNTIME_DIR);
-      const relPaths = allFiles.map((f) => f.relPath);
-      const allowRes = validateRuntimeAllowlist(relPaths);
-
-      if (!allowRes.valid) {
-        console.error('\n❌ Allowlist validation failed! Unallowlisted files in runtime directory:');
-        allowRes.unallowlistedPaths.forEach((p) => console.error(`  - ${p}`));
-        process.exit(1);
-      }
-
-      allowlistPassed = allowRes.valid;
-    } catch (e) {
-      console.warn(`Warning: Failed to run runtime allowlist check: ${e.message}`);
-    }
+  if (runCapture('git', ['rev-parse', 'HEAD'], { cwd: repo }) !== upstreamCommit ||
+      runCapture('git', ['status', '--porcelain', '--untracked-files=normal'], { cwd: repo }) !==
+        upstreamStatus) {
+    throw new Error('Upstream source changed during runtime preparation.');
   }
 
-  const manifest = {
-    wrapperCommit,
+  const toolchains = {};
+  let pythonPackages = [];
+  if (completedSteps.includes('python')) {
+    const pythonExe = path.join(RUNTIME_DIR, 'python', 'python.exe');
+    toolchains.python = runCapture(pythonExe, ['--version']).replace(/^Python /, '');
+    pythonPackages = JSON.parse(runCapture(pythonExe, [
+      '-I', '-c', 'import importlib.metadata as m,json; print(json.dumps(sorted([{"name":d.metadata["Name"],"version":d.version} for d in m.distributions()],key=lambda d:d["name"].lower())))',
+    ]));
+  }
+  if (completedSteps.includes('surreal')) {
+    const version = runCapture(path.join(RUNTIME_DIR, 'surreal/surreal.exe'), ['version']);
+    toolchains.surreal = (version.match(/\b(2\.6\.5(?:\+[^\s]+)?)(?=\s|$)/) || [])[1] || version;
+  }
+  const manifest = await writePreparationManifest(RUNTIME_DIR, {
+    wrapperCommit: runCapture('git', ['rev-parse', 'HEAD'], { cwd: PROJECT_DIR }),
     upstreamCommit,
-    buildTimestamp: new Date().toISOString(),
+    expectedUpstreamCommit: lockData.commit,
+    upstreamPinMatched,
+    upstreamWorkingTreeClean,
+    preparationStep: step,
+    completedSteps,
+    frontendKind: 'parallel-static-client-poc',
+    targetPlatform: process.platform,
     targetArchitecture: os.arch(),
     variant,
-    allowlistPassed,
-    toolchains: {
-      surreal: SURREAL_VERSION,
-      python: '3.12',
-    }
-  };
+    toolchains,
+    pythonPackages,
+  }, validateRuntimeAllowlist);
 
-  fs.writeFileSync(path.join(RUNTIME_DIR, 'manifest.json'), JSON.stringify(manifest, null, 2));
-
-  console.log('\n✅ Runtime prepared successfully.');
-  console.log('You can now run the app with `npm start`, package it with `npm run package:app`, or build the installer with `npm run installer`.');
+  if (step !== 'all') {
+    console.log('Prepared component: ' + step + '. Partial inventory only; packaging remains blocked.');
+  } else if (!manifest.assemblyComplete) {
+    throw new Error('Runtime assembly remains incomplete:\n' + manifest.assemblyProblems.join('\n'));
+  } else {
+    console.log('Runtime assembly inventory verified. Installed-application acceptance remains separate.');
+  }
 }
 
 main().catch((err) => {
-  console.error('\n❌ Preparation failed:', err && err.message);
-  process.exit(1);
+  console.error('Preparation failed:', err && err.message);
+  process.exitCode = 1;
 });
