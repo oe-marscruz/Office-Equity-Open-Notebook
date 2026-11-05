@@ -2,6 +2,7 @@
  * Executable test runner for Permanent Performance Harness (L0.5)
  */
 
+const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
 
