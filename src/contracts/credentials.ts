@@ -56,10 +56,9 @@ export function describeCredentialStore(dataDir: string): CredentialStoreLayout 
 /**
  * Resolves the SurrealDB credentials to start the database with.
  *
- * An install whose datastore predates per-install credentials keeps the
- * original `root` password, because SurrealDB applies initial root
- * credentials only when no root user exists yet. Only fresh installs receive
- * a randomly generated password.
+ * Missing or invalid stored credentials require recovery. New credentials
+ * are generated only when no datastore exists, and must be protected and
+ * durably persisted before they can be returned.
  */
 export function resolveDatabaseCredentials(dataDir: string): DatabaseCredentials {
   return credentialsModule.resolveDatabaseCredentials(dataDir) as DatabaseCredentials;
@@ -93,8 +92,8 @@ export function hasExistingDatastore(dataDir: string): boolean {
 /**
  * Restricts a file to the current OS user.
  *
- * Best effort by design: a failure here must never stop the app from
- * starting.
+ * Reports the observed protection result. Store operations fail closed if
+ * protection cannot be established.
  */
 export function restrictToCurrentUser(file: string): boolean {
   return credentialsModule.restrictToCurrentUser(file) as boolean;
@@ -150,7 +149,7 @@ export function inspectEncryptionKeyStore(dataDir: string): CredentialStoreResul
     value,
     persisted: existedBefore,
     obfuscatedAtRest: isObfuscatedAtRest(layout.encryptionKeyFile),
-    aclRestricted: true,
+    aclRestricted: restrictToCurrentUser(layout.encryptionKeyFile),
   };
 }
 
@@ -165,7 +164,7 @@ export function inspectDatabasePasswordStore(dataDir: string): CredentialStoreRe
     value,
     persisted: existedBefore,
     obfuscatedAtRest: isPasswordObfuscatedAtRest(layout.secretsFile),
-    aclRestricted: true,
+    aclRestricted: restrictToCurrentUser(layout.secretsFile),
   };
 }
 

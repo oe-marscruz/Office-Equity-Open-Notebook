@@ -4,7 +4,7 @@
   "productionControlsVerified": false,
   "vulnerabilityScanPerformed": false,
   "title": "L8.2 synthetic redaction checks and outstanding security evidence",
-  "timestamp": "2026-11-03T15:48:57.712Z",
+  "timestamp": "2026-11-03T05:00:21.874Z",
   "limitations": [
     "Only synthetic redaction examples were executed; the helper is not integrated into production log sinks.",
     "Secret handling, request middleware, diagnostics exports, and backend authorization are unverified.",
@@ -46,7 +46,7 @@
       "isRedacted": false,
       "maskPattern": "/home/[USER_REDACTED]/...",
       "passed": false,
-      "notes": "Launcher output minimization has process-boundary tests; installed-app, backend-owned files, crash and export verification remain outstanding."
+      "notes": "Unverified: native and JavaScript launchers currently capture raw service output."
     },
     {
       "id": "TRACE_CONFIG_1",
