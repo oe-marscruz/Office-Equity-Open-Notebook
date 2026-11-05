@@ -2,7 +2,6 @@
  * Executable test runner for Permanent Performance Harness (L0.5)
  */
 
-const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
 
@@ -62,37 +61,84 @@ async function runTest() {
   });
   console.log(`  -> Task executed in ${timing.durationMs} ms (Result: ${timing.result})`);
 
-  // Step 4: Quantify Measurement Noise over Two Benchmark Runs
-  console.log('\n--- Suite 4: Quantification of Measurement Noise (2 Runs) ---');
-  const baselinePath = path.join(__dirname, '../../artifacts/modernization/benchmarks/baseline.json');
-  if (!fs.existsSync(baselinePath)) {
-    throw new Error(`Baseline JSON not found at ${baselinePath}`);
+  // Comparison inputs are synthetic; this does not measure application performance.
+  console.log('\n--- Suite 4: Synthetic comparison arithmetic ---');
+  const baselineData = {
+  "packet": "synthetic-unit-fixture",
+  "timestamp": "2000-01-01T00:00:00.000Z",
+  "host": "synthetic-unit-test",
+  "environment": {
+    "os": "synthetic",
+    "nodeVersion": "synthetic",
+    "electronVersion": "synthetic",
+    "pythonVersion": "synthetic",
+    "surrealDbVersion": "synthetic",
+    "cpuModel": "synthetic",
+    "totalMemoryBytes": 1000
+  },
+  "artifactSizes": {
+    "installerBytes": 1000,
+    "installedBytes": 1000,
+    "runtimeDirectoryBytes": 1000,
+    "electronBytes": 1000,
+    "nodeRuntimeBytes": 1000,
+    "pythonRuntimeBytes": 1000,
+    "pythonSitePackagesBytes": 1000,
+    "doclingBytes": 1000,
+    "surrealDbBytes": 1000
+  },
+  "runtimeMetrics": {
+    "idleProcessCount": 1000,
+    "idlePrivateWorkingSetRssBytes": 1000,
+    "idleTotalWorkingSetBytes": 1000,
+    "idleCpuPercent": 1000,
+    "coldStartToWindowMs": 1000,
+    "coldStartToApiReadyMs": 1000,
+    "coldStartToUsableUiMs": 1000,
+    "cleanShutdownDurationMs": 1000,
+    "restartAfterCrashSuccess": true
+  },
+  "workloadMetrics": {
+    "peakMemoryPdfIngestBytes": 1000,
+    "peakMemoryOcrIngestBytes": 1000,
+    "searchLatencyP95Ms": 1000,
+    "ragResponseLatencyP95Ms": 1000
   }
-  const baselineData = JSON.parse(fs.readFileSync(baselinePath, 'utf8'));
+};
 
-  // Run 1: Validate baseline schema
+  // Validate the synthetic comparison fixture
   const val1 = validatePerformanceBenchmarkResult(baselineData);
   if (!val1.valid) {
-    throw new Error(`Baseline benchmark validation failed: ${val1.errors.join(', ')}`);
+    throw new Error(`Synthetic fixture validation failed: ${val1.errors.join(', ')}`);
   }
-  console.log('  -> Run 1: Baseline benchmark JSON schema verified valid');
+  console.log('  -> Synthetic comparison fixture schema verified valid');
 
-  // Run 2: Simulate second benchmark run with 2% variance
+  // Exercise a 2% synthetic delta within the comparison tolerance
   const run2Data = JSON.parse(JSON.stringify(baselineData));
   run2Data.timestamp = new Date().toISOString();
   run2Data.runtimeMetrics.coldStartToUsableUiMs = Math.round(baselineData.runtimeMetrics.coldStartToUsableUiMs * 1.02); // +2% noise
   const val2 = validatePerformanceBenchmarkResult(run2Data);
   if (!val2.valid) {
-    throw new Error(`Run 2 validation failed: ${val2.errors.join(', ')}`);
+    throw new Error(`Synthetic candidate validation failed: ${val2.errors.join(', ')}`);
   }
 
   const comparison = compareBenchmarkToBaseline(baselineData, run2Data, 5.0); // 5% noise band
-  console.log(`  -> Measured delta: ${comparison.comparisons['coldStartToUsableUiMs'].deltaPercent.toFixed(2)}%`);
+  console.log(`  -> Synthetic delta: ${comparison.comparisons['coldStartToUsableUiMs'].deltaPercent.toFixed(2)}%`);
   console.log(`  -> Within noise band (+/-5%): ${comparison.comparisons['coldStartToUsableUiMs'].withinNoiseBand}`);
   console.log(`  -> Has regressions: ${comparison.hasRegressions}`);
 
   if (comparison.hasRegressions) {
     throw new Error('Expected 2% noise to be within 5% noise band without regressions');
+  }
+
+  for (const [factor, expected] of [[1.1, 'regressed'], [0.9, 'improved']]) {
+    const candidate = JSON.parse(JSON.stringify(baselineData));
+    candidate.runtimeMetrics.coldStartToUsableUiMs *= factor;
+    const result = compareBenchmarkToBaseline(baselineData, candidate, 5.0);
+    if (result.comparisons.coldStartToUsableUiMs.status !== expected ||
+        result.hasRegressions !== (expected === 'regressed')) {
+      throw new Error(`Expected synthetic comparison status ${expected}`);
+    }
   }
 
   // Step 5: Verify Missing/Invalid Metrics Fail Loudly
