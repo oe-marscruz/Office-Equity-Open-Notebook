@@ -63,10 +63,12 @@ jobs:
   build-installer:
     needs: ci-pipeline
     # The runtime-evidence gate in scripts/lib/runtime-evidence.js intentionally
-    # rejects packaging while the frontend is a POC (F05 open). Until F05 delivers
-    # a functional frontend, this job reports the known failure without blocking
-    # merges. Remove this once the gate can pass.
-    continue-on-error: true
+    # rejects packaging while the frontend is a POC (F05 open). Until F05
+    # delivers a functional frontend, the Prepare Runtime step reports that one
+    # known failure. The step tolerates ONLY the documented gate message and
+    # still fails on any other error; the summary step re-checks state so an
+    # unexpected failure cannot hide behind this. Remove this tolerance once
+    # the gate can pass.
     runs-on: windows-latest
     steps:
       - name: Checkout Repository
@@ -151,7 +153,24 @@ jobs:
         run: npm run build:types
 
       - name: Prepare Runtime
-        run: node scripts/prepare-runtime.js --repo="${{ github.workspace }}/open-notebook"
+        shell: pwsh
+        run: |
+          # F05 gate: packaging intentionally stops while the frontend is a POC.
+          # Record that known outcome instead of failing the job; anything else
+          # must still fail the step.
+          $state = "failed"
+          $output = node scripts/prepare-runtime.js --repo="${{ github.workspace }}/open-notebook" 2>&1 | Tee-Object -Variable allOutput
+          $allOutput | ForEach-Object { Write-Host $_ }
+          if ($LASTEXITCODE -eq 0) {
+            $state = "passed"
+          } elseif (($allOutput -join "`n") -match "Frontend is a proof of concept; functional application assembly remains open\." -and
+                    ($allOutput -join "`n") -match "Preparation failed: Runtime assembly remains incomplete:") {
+            Write-Host "::warning::Installer packaging stopped at the intentional F05 runtime-assembly gate (POC frontend). See docs/compliance/ferpa/RUNTIME_ASSEMBLY_HANDOFF.md."
+            $state = "f05-gate"
+          } else {
+            exit 1
+          }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "PREPARE_RUNTIME_STATE=$state"
 
       - name: Package App (Native Tauri)
         run: npm run package:app
@@ -164,6 +183,22 @@ jobs:
             exit 1
           }
           node scripts/build-installer-native.js --makensis "$env:MAKENSIS"
+
+      - name: Confirm Runtime Gate State
+        shell: pwsh
+        run: |
+          # Fail the job if the Prepare Runtime step did not pass and the stop
+          # was not the documented F05 POC-frontend gate.
+          if ($env:PREPARE_RUNTIME_STATE -eq "passed") {
+            Write-Host "Runtime preparation passed; packaging ran normally."
+            exit 0
+          }
+          if ($env:PREPARE_RUNTIME_STATE -eq "f05-gate") {
+            Write-Host "::warning::Expected state: the F05 runtime-assembly gate remains open until a functional frontend is delivered. No installer artifact is produced by design."
+            exit 0
+          }
+          Write-Error "Prepare Runtime did not pass and did not stop at the documented F05 gate (state: '$($env:PREPARE_RUNTIME_STATE)')"
+          exit 1
 
       - name: Verify Installer Artifact
         shell: pwsh
