@@ -167,10 +167,9 @@ jobs:
                     ($allOutput -join "`n") -match "Preparation failed: Runtime assembly remains incomplete:") {
             Write-Host "::warning::Installer packaging stopped at the intentional F05 runtime-assembly gate (POC frontend). See docs/compliance/ferpa/RUNTIME_ASSEMBLY_HANDOFF.md."
             $state = "f05-gate"
-          } else {
-            exit 1
           }
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "PREPARE_RUNTIME_STATE=$state"
+          if ($state -eq "failed") { exit 1 } else { exit 0 }
 
       - name: Package App (Native Tauri)
         run: npm run package:app
