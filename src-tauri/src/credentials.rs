@@ -22,11 +22,11 @@
 //!
 //! # Legacy installs
 //!
-//! SurrealDB applies the initial root credentials *only when no root user
-//! exists yet*. A datastore created by an older build already has a root
-//! user, so a newly generated password has no effect and the backend would
-//! be locked out of its own data. Existing datastores therefore keep their
-//! original `root` password; only fresh installs receive a random one.
+//! Existing datastores with missing credentials require explicit recovery.
+//! Startup never assumes a legacy password or replaces a damaged secret.
+//!
+//! Obfuscation does not authenticate stored values, so some corruption cannot
+//! be detected without changing the shared on-disk format.
 //!
 //! # Cross-language on-disk contract
 //!
@@ -260,9 +260,6 @@ pub fn decode_secret(stored: &str) -> String {
 }
 
 /// Restricts a file to the current OS user.
-///
-/// This is best effort by design: a failure here must never stop the app
-/// from starting, so every error is swallowed.
 pub fn restrict_to_current_user(file: &Path) -> bool {
     #[cfg(windows)]
     {
@@ -270,17 +267,12 @@ pub fn restrict_to_current_user(file: &Path) -> bool {
             Ok(value) if !value.trim().is_empty() => value,
             _ => return false,
         };
-        let grant = format!("{}:F", user);
         std::process::Command::new("icacls")
-            .arg(file)
-            .arg("/inheritance:r")
-            .arg("/grant:r")
-            .arg(&grant)
+            .arg(file).arg("/inheritance:r").arg("/grant:r")
+            .arg(format!("{}:F", user))
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+            .status().map(|status| status.success()).unwrap_or(false)
     }
     #[cfg(not(windows))]
     {
@@ -289,164 +281,129 @@ pub fn restrict_to_current_user(file: &Path) -> bool {
     }
 }
 
-/// Writes `contents` to `file` and restricts it to the current OS user.
-fn write_secret_file(file: &Path, contents: &str) {
-    if let Some(parent) = file.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if fs::write(file, contents.as_bytes()).is_ok() {
-        restrict_to_current_user(file);
-    }
-}
-
-/// Writes the encryption key, obfuscated, to `file`.
-fn write_encryption_key_file(file: &Path, key: &str) {
-    write_secret_file(file, &encode_secret(key));
-}
-
-/// Reads the encryption key from `file`.
-fn read_encryption_key_file(file: &Path) -> String {
+fn protected_read(file: &Path) -> Result<Option<String>, String> {
     match fs::read_to_string(file) {
-        Ok(contents) => decode_secret(&contents),
-        Err(_) => String::new(),
+        Ok(contents) => {
+            if !restrict_to_current_user(file) {
+                return Err("Could not restrict credential file permissions".into());
+            }
+            Ok(Some(contents))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err("Could not read credential file".into()),
     }
 }
 
-/// True when `data_dir` already holds a SurrealDB datastore from an earlier run.
-///
-/// RocksDB stores its datastore in a directory, which reports a size of 0 on
-/// Windows, so both shapes have to be checked.
-pub fn has_existing_datastore(data_dir: &Path) -> bool {
+fn protected_write(file: &Path, contents: &str) -> Result<(), String> {
+    use std::io::Write;
+    let parent = file.parent().ok_or("Invalid credential path")?;
+    fs::create_dir_all(parent).map_err(|_| "Could not create credential directory")?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options.open(file).map_err(|_| "Could not create credential file")?;
+    if !restrict_to_current_user(file) {
+        return Err("Could not restrict credential file permissions".into());
+    }
+    output.write_all(contents.as_bytes()).map_err(|_| "Could not write credential file")?;
+    output.sync_all().map_err(|_| "Could not persist credential file")?;
+    Ok(())
+}
+
+fn decode_checked(stored: &str) -> Result<String, String> {
+    let raw = stored.trim();
+    let decoded = if let Some(encoded) = raw.strip_prefix(OBFUSCATION_PREFIX) {
+        let bytes = STANDARD.decode(encoded).map_err(|_| "Invalid encoded credential")?;
+        String::from_utf8(xor_obfuscate(&bytes, &derive_obfuscation_key()))
+            .map_err(|_| "Invalid credential encoding")?
+    } else {
+        raw.to_string()
+    };
+    if decoded.is_empty() || decoded.chars().any(|c| c.is_control()) {
+        return Err("Invalid credential value".into());
+    }
+    Ok(decoded)
+}
+
+/// Returns whether a datastore exists, failing closed on inspection errors.
+pub fn has_existing_datastore(data_dir: &Path) -> Result<bool, String> {
     let file = data_dir.join(DATABASE_DIRNAME).join(DATABASE_FILENAME);
     match fs::metadata(&file) {
-        Ok(metadata) => {
-            if metadata.is_dir() {
-                fs::read_dir(&file)
-                    .map(|mut entries| entries.next().is_some())
-                    .unwrap_or(false)
-            } else {
-                metadata.len() > 0
+        Ok(metadata) if metadata.is_dir() => {
+            let mut entries = fs::read_dir(&file).map_err(|_| "Could not inspect datastore")?;
+            match entries.next() {
+                Some(Ok(_)) => Ok(true),
+                Some(Err(_)) => Err("Could not inspect datastore".into()),
+                None => Ok(false),
             }
         }
-        Err(_) => false,
+        Ok(metadata) => Ok(metadata.len() > 0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err("Could not inspect datastore".into()),
     }
 }
 
-/// Generates a random base64url password.
-fn random_password() -> String {
+fn random_password() -> Result<String, String> {
     let mut bytes = [0u8; DATABASE_PASSWORD_BYTES];
-    if getrandom::getrandom(&mut bytes).is_err() {
-        // Fall back to a time-seeded value rather than failing startup.
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let mut state = nanos as u64 ^ ((std::process::id() as u64) << 32);
-        for byte in bytes.iter_mut() {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            *byte = (state >> 33) as u8;
-        }
-    }
-    URL_SAFE_NO_PAD.encode(bytes)
+    getrandom::getrandom(&mut bytes).map_err(|_| "Secure random generator failed")?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
-/// Returns the persisted database password for `data_dir`, generating one on
-/// first use.
-pub fn ensure_database_password(data_dir: &Path) -> String {
-    let secrets_file = data_dir.join(SECRETS_FILENAME);
-    if let Ok(contents) = fs::read_to_string(&secrets_file) {
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&contents) {
-            if let Some(stored) = parsed.get("surrealPassword").and_then(|v| v.as_str()) {
-                if !stored.is_empty() {
-                    return decode_secret(stored);
-                }
-            }
-        }
-        // A corrupt secrets file is rewritten below rather than crashing startup.
+/// Reads an existing password or securely creates one for a new datastore.
+pub fn ensure_database_password(data_dir: &Path) -> Result<String, String> {
+    let file = data_dir.join(SECRETS_FILENAME);
+    if let Some(contents) = protected_read(&file)? {
+        let parsed: serde_json::Value = serde_json::from_str(&contents)
+            .map_err(|_| "Invalid database credential file")?;
+        let stored = parsed.get("surrealPassword").and_then(|v| v.as_str())
+            .ok_or("Invalid database credential file")?;
+        return decode_checked(stored);
     }
-
-    let password = random_password();
-    write_secret_file(
-        &secrets_file,
-        &format!(
-            "{}\n",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "surrealPassword": encode_secret(&password),
-            }))
-            .unwrap_or_default()
-        ),
-    );
-    password
+    if has_existing_datastore(data_dir)? {
+        return Err("Existing datastore has no credential file; recovery is required".into());
+    }
+    let password = random_password()?;
+    let contents = serde_json::to_string_pretty(&serde_json::json!({
+        "surrealPassword": encode_secret(&password),
+    })).map_err(|_| "Could not serialize database credential")? + "\n";
+    protected_write(&file, &contents)?;
+    Ok(password)
 }
 
-/// Resolves the SurrealDB credentials to start the database with.
-///
-/// SurrealDB applies the initial root credentials only when no root user
-/// exists yet, so a freshly generated password has no effect on a datastore
-/// created by an older build: the stored root credentials win and the backend
-/// would be locked out of its own data. Existing datastores therefore keep
-/// their original password so upgrades never lose notebook content; only new
-/// installs get a random one.
-pub fn resolve_database_credentials(data_dir: &Path) -> DatabaseCredentials {
-    let secrets_file = data_dir.join(SECRETS_FILENAME);
-    let had_secrets = secrets_file.exists();
-    if has_existing_datastore(data_dir) && !had_secrets {
-        return DatabaseCredentials {
-            user: DATABASE_USER.to_string(),
-            password: LEGACY_DATABASE_PASSWORD.to_string(),
-            legacy: true,
-            source: CredentialSource::Legacy,
-        };
-    }
-    let password = ensure_database_password(data_dir);
-    DatabaseCredentials {
-        user: DATABASE_USER.to_string(),
-        password,
-        legacy: false,
-        source: if had_secrets {
-            CredentialSource::Stored
-        } else {
-            CredentialSource::Generated
-        },
-    }
+pub fn resolve_database_credentials(data_dir: &Path) -> Result<DatabaseCredentials, String> {
+    let existed = match fs::metadata(data_dir.join(SECRETS_FILENAME)) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => return Err("Could not inspect database credential file".into()),
+    };
+    let password = ensure_database_password(data_dir)?;
+    Ok(DatabaseCredentials {
+        user: DATABASE_USER.to_string(), password, legacy: false,
+        source: if existed { CredentialSource::Stored } else { CredentialSource::Generated },
+    })
 }
 
-/// Returns the persisted encryption key for `data_dir`, generating a random
-/// 32-byte key on first use.
-///
-/// The key is stored obfuscated so it never appears in plaintext on disk.
-/// Legacy plaintext key files are still readable, but new keys use the
-/// obfuscated format.
-pub fn ensure_encryption_key(data_dir: &Path) -> String {
-    let key_file = data_dir.join(KEY_FILENAME);
-    if key_file.exists() {
-        let existing = read_encryption_key_file(&key_file);
-        if !existing.is_empty() {
-            return existing;
+pub fn ensure_encryption_key(data_dir: &Path) -> Result<String, String> {
+    let file = data_dir.join(KEY_FILENAME);
+    if let Some(contents) = protected_read(&file)? {
+        let key = decode_checked(&contents)?;
+        if key.len() != ENCRYPTION_KEY_BYTES * 2 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("Invalid encryption key".into());
         }
+        return Ok(key);
+    }
+    if has_existing_datastore(data_dir)? {
+        return Err("Existing datastore has no encryption key; recovery is required".into());
     }
     let mut bytes = [0u8; ENCRYPTION_KEY_BYTES];
-    if getrandom::getrandom(&mut bytes).is_err() {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let mut state = nanos as u64;
-        for byte in bytes.iter_mut() {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            *byte = (state >> 33) as u8;
-        }
-    }
-    let key = bytes
-        .iter()
-        .map(|byte| format!("{:02x}", byte))
-        .collect::<String>();
-    write_encryption_key_file(&key_file, &key);
-    key
+    getrandom::getrandom(&mut bytes).map_err(|_| "Secure random generator failed")?;
+    let key: String = bytes.iter().map(|byte| format!("{:02x}", byte)).collect();
+    protected_write(&file, &encode_secret(&key))?;
+    Ok(key)
 }
 
 /// Builds the environment variables that carry the database credentials to the
@@ -557,7 +514,7 @@ mod tests {
     #[test]
     fn fresh_install_generates_a_random_password() {
         let dir = tempdir("fresh");
-        let credentials = resolve_database_credentials(&dir);
+        let credentials = resolve_database_credentials(&dir).unwrap();
         assert_eq!(credentials.user, DATABASE_USER);
         assert!(!credentials.legacy);
         assert_eq!(credentials.source, CredentialSource::Generated);
@@ -570,45 +527,56 @@ mod tests {
     }
 
     #[test]
-    fn existing_datastore_keeps_the_legacy_password() {
+    fn existing_datastore_without_credentials_fails_closed() {
         let dir = tempdir("legacy");
         let db = dir.join(DATABASE_DIRNAME).join(DATABASE_FILENAME);
-        fs::create_dir_all(&db).expect("datastore dir");
-        fs::write(db.join("CURRENT"), b"x").expect("datastore file");
-
-        let credentials = resolve_database_credentials(&dir);
-        assert_eq!(credentials.password, LEGACY_DATABASE_PASSWORD);
-        assert!(credentials.legacy);
-        assert_eq!(credentials.source, CredentialSource::Legacy);
+        fs::create_dir_all(&db).unwrap();
+        fs::write(db.join("CURRENT"), b"x").unwrap();
+        assert!(resolve_database_credentials(&dir).is_err());
+        assert!(ensure_encryption_key(&dir).is_err());
         assert!(!dir.join(SECRETS_FILENAME).exists());
-        std::fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn stored_password_survives_a_restart() {
         let dir = tempdir("restart");
-        let first = resolve_database_credentials(&dir);
-        let second = resolve_database_credentials(&dir);
+        let first = resolve_database_credentials(&dir).unwrap();
+        let second = resolve_database_credentials(&dir).unwrap();
         assert_eq!(first.password, second.password);
         assert_eq!(second.source, CredentialSource::Stored);
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn corrupt_secrets_file_is_regenerated() {
+    fn corrupt_credentials_are_preserved_and_rejected() {
         let dir = tempdir("corrupt");
-        fs::write(dir.join(SECRETS_FILENAME), "{not json").expect("corrupt file");
-        let credentials = resolve_database_credentials(&dir);
-        assert!(!credentials.password.is_empty());
-        assert!(!credentials.legacy);
-        std::fs::remove_dir_all(&dir).ok();
+        let file = dir.join(SECRETS_FILENAME);
+        fs::write(&file, "{not json").unwrap();
+        assert!(resolve_database_credentials(&dir).is_err());
+        assert_eq!(fs::read(&file).unwrap(), b"{not json");
+        let key = dir.join(KEY_FILENAME);
+        fs::write(&key, "obf:%%%").unwrap();
+        assert!(ensure_encryption_key(&dir).is_err());
+        assert_eq!(fs::read(&key).unwrap(), b"obf:%%%");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn inaccessible_credential_path_fails_closed() {
+        let dir = tempdir("unwritable");
+        let path = dir.join("file");
+        fs::write(&path, b"x").unwrap();
+        assert!(resolve_database_credentials(&path).is_err());
+        assert!(ensure_encryption_key(&path).is_err());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn encryption_key_is_stable_and_obfuscated_at_rest() {
         let dir = tempdir("key");
-        let first = ensure_encryption_key(&dir);
-        let second = ensure_encryption_key(&dir);
+        let first = ensure_encryption_key(&dir).unwrap();
+        let second = ensure_encryption_key(&dir).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.len(), ENCRYPTION_KEY_BYTES * 2);
 
