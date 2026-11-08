@@ -72,14 +72,14 @@ pub async fn start_services(runtime_path: PathBuf) -> Result<(), String> {
     }
 
     let data_dir = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(".")).join("OfficeEquityOpenNotebook");
-    fs::create_dir_all(&data_dir).unwrap_or_default();
+    fs::create_dir_all(&data_dir).map_err(|_| "Could not create application data directory")?;
 
     // Resolve the per-install database credentials and the provider-API-key
     // encryption key. The credentials travel through the child environment
     // rather than the command line so they never appear in a process listing.
-    let credentials = credentials::resolve_database_credentials(&data_dir);
+    let credentials = credentials::resolve_database_credentials(&data_dir)?;
     let credential_env = credentials::build_credential_environment(&credentials);
-    let encryption_key = credentials::ensure_encryption_key(&data_dir);
+    let encryption_key = credentials::ensure_encryption_key(&data_dir)?;
 
     let logs_dir = data_dir.join("logs");
     fs::create_dir_all(&logs_dir).unwrap_or_default();

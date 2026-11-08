@@ -16,7 +16,7 @@
  *     tiktoken-cache pre-downloaded tiktoken encoding (offline support)
  *
  * Usage:
- *   node scripts/prepare-runtime.js [--repo <path>] [--step <name>]
+ *   node scripts/prepare-runtime.js [--repo <path>] [--step <name>] [--output <path>] [--lock-file <path>]
  *
  * Steps: frontend | python | surreal | node | tiktoken | backend | all
  */
@@ -30,7 +30,7 @@ const https = require('https');
 const http = require('http');
 
 const PROJECT_DIR = path.join(__dirname, '..');
-const RUNTIME_DIR = path.join(PROJECT_DIR, 'resources', 'runtime');
+const RUNTIME_DIR = path.resolve(readFlag(process.argv.slice(2), '--output', path.join(PROJECT_DIR, 'resources', 'runtime')));
 const CACHE_DIR = path.join(PROJECT_DIR, 'resources', '.cache');
 const DEFAULT_REPO = path.join(PROJECT_DIR, '..', 'open-notebook');
 
@@ -338,7 +338,7 @@ async function main() {
     process.exit(1);
   }
 
-  const lockFilePath = path.join(PROJECT_DIR, 'upstream.lock.json');
+  const lockFilePath = path.resolve(readFlag(args, '--lock-file', path.join(PROJECT_DIR, 'upstream.lock.json')));
   let lockData = null;
   if (fs.existsSync(lockFilePath)) {
     lockData = JSON.parse(fs.readFileSync(lockFilePath, 'utf8'));
