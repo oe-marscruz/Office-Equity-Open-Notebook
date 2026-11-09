@@ -173,10 +173,8 @@ async function migrateLegacyDatastore(dataDir, datastore) {
         recovered: true,
       };
     }
-    // The provisioned password does not authenticate, so no rotation committed.
-    // The datastore is therefore still on the legacy credential; drop the stale
-    // recovery file and start the migration cleanly below.
-    clearPendingPassword(pendingFile);
+    // A rejected pending password does not establish the current credential.
+    // Keep the recovery file until the legacy password is proven to work.
   }
 
   const legacyState = await datastore.probe(LEGACY_PROBE_PASSWORD);
@@ -195,6 +193,8 @@ async function migrateLegacyDatastore(dataDir, datastore) {
     );
   }
 
+  if (pending !== null) clearPendingPassword(pendingFile);
+
   const provisioned = crypto.randomBytes(DATABASE_PASSWORD_BYTES).toString('base64url');
 
   // Step 2: persist before rotating. This is the window that covers a crash
@@ -203,25 +203,40 @@ async function migrateLegacyDatastore(dataDir, datastore) {
 
   try {
     await datastore.rotate(LEGACY_PROBE_PASSWORD, provisioned);
-  } catch (rotateError) {
-    // The rotation may have committed even though the call failed — a dropped
-    // response looks identical to a rejected statement. Probe for the new
-    // password before concluding the datastore is unchanged, because discarding
-    // the recovery file on a committed rotation would destroy the password.
-    let after = PROBE_UNREACHABLE;
+  } catch (_) {
+    // A lost response may still mean the rotation committed; probe either way.
+  }
+
+  let after = PROBE_UNREACHABLE;
+  try {
+    after = await datastore.probe(provisioned);
+  } catch (_) {}
+  if (after === PROBE_UNREACHABLE) {
+    // The pending file may be the only copy of a committed password.
+    throw new CredentialError(
+      'The datastore could not be reached to confirm its credential migration',
+      CREDENTIAL_ERROR_DATASTORE_UNREADABLE,
+      dataDir
+    );
+  }
+  if (after !== PROBE_AUTHENTICATED) {
+    let legacyAfter = PROBE_UNREACHABLE;
     try {
-      after = await datastore.probe(provisioned);
-    } catch (_) {
-      after = PROBE_UNREACHABLE;
-    }
-    if (after !== PROBE_AUTHENTICATED) {
-      clearPendingPassword(pendingFile);
+      legacyAfter = await datastore.probe(LEGACY_PROBE_PASSWORD);
+    } catch (_) {}
+    if (legacyAfter === PROBE_AUTHENTICATED) clearPendingPassword(pendingFile);
+    if (legacyAfter === PROBE_UNREACHABLE) {
       throw new CredentialError(
-        'Credential rotation failed; the existing datastore is unchanged',
-        CREDENTIAL_ERROR_MIGRATION_REJECTED,
-        secretsFile
+        'The datastore could not be reached to confirm its credential migration',
+        CREDENTIAL_ERROR_DATASTORE_UNREADABLE,
+        dataDir
       );
     }
+    throw new CredentialError(
+      'Credential rotation could not be confirmed',
+      CREDENTIAL_ERROR_MIGRATION_REJECTED,
+      secretsFile
+    );
   }
 
   // Step 6 and 7.

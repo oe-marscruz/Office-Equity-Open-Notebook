@@ -748,6 +748,85 @@ async function run() {
       });
     }
 
+    await check('a successful rotation response still requires an authenticated new password', async () => {
+      const dir = tempDir('migration-unconfirmed-success');
+      try {
+        seedLegacyDatastore(dir);
+        const datastore = {
+          probe: (password) => password === migration.LEGACY_PROBE_PASSWORD
+            ? migration.PROBE_AUTHENTICATED : migration.PROBE_REJECTED,
+          rotate: () => {},
+        };
+        await assert.rejects(
+          migration.migrateLegacyDatastore(dir, datastore),
+          (error) => error.code === credentials.CREDENTIAL_ERROR_MIGRATION_REJECTED
+        );
+        assert.equal(fs.existsSync(path.join(dir, credentials.SECRETS_FILENAME)), false);
+        assert.equal(fs.existsSync(path.join(dir, migration.MIGRATION_PENDING_FILENAME)), false);
+      } finally {
+        cleanup(dir);
+      }
+    });
+
+    await check('a lost rotation response and unavailable probe preserve recovery', async () => {
+      const dir = tempDir('migration-lost-response');
+      try {
+        seedLegacyDatastore(dir);
+        let current = migration.LEGACY_PROBE_PASSWORD;
+        let reachable = true;
+        const datastore = {
+          probe(password) {
+            if (!reachable) return migration.PROBE_UNREACHABLE;
+            return password === current ? migration.PROBE_AUTHENTICATED : migration.PROBE_REJECTED;
+          },
+          rotate(_oldPassword, newPassword) {
+            current = newPassword;
+            reachable = false;
+            throw new Error('rotation response lost');
+          },
+        };
+        await assert.rejects(
+          migration.migrateLegacyDatastore(dir, datastore),
+          (error) => error.code === credentials.CREDENTIAL_ERROR_DATASTORE_UNREADABLE
+        );
+        const pendingFile = path.join(dir, migration.MIGRATION_PENDING_FILENAME);
+        assert.equal(migration.readPendingPassword(pendingFile), current);
+        assert.equal(fs.existsSync(path.join(dir, credentials.SECRETS_FILENAME)), false);
+
+        reachable = true;
+        const recovered = await migration.migrateLegacyDatastore(dir, datastore);
+        assert.equal(recovered.recovered, true);
+        assert.equal(recovered.password, current);
+        assert.equal(fs.existsSync(pendingFile), false);
+        assert.equal(credentials.resolveDatabaseCredentials(dir).password, current);
+      } finally {
+        cleanup(dir);
+      }
+    });
+
+    await check('a rejected pending password is kept until the legacy credential is confirmed', async () => {
+      const dir = tempDir('migration-unconfirmed-legacy');
+      try {
+        seedLegacyDatastore(dir);
+        const pendingFile = path.join(dir, migration.MIGRATION_PENDING_FILENAME);
+        credentials.writeSecretFile(pendingFile, credentials.encodeSecret('pending-recovery'));
+        const before = fs.readFileSync(pendingFile);
+        const datastore = {
+          probe: (password) => password === 'pending-recovery'
+            ? migration.PROBE_REJECTED : migration.PROBE_UNREACHABLE,
+          rotate: () => assert.fail('uncertain state must not rotate'),
+        };
+        await assert.rejects(
+          migration.migrateLegacyDatastore(dir, datastore),
+          (error) => error.code === credentials.CREDENTIAL_ERROR_DATASTORE_UNREADABLE
+        );
+        assert.deepEqual(fs.readFileSync(pendingFile), before);
+        assert.equal(fs.existsSync(path.join(dir, credentials.SECRETS_FILENAME)), false);
+      } finally {
+        cleanup(dir);
+      }
+    });
+
     await check('a resolved install is never migrated', () => {
       const dir = tempDir('migration-noop');
       try {
