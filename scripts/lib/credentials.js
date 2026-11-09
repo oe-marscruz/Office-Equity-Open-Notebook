@@ -219,6 +219,26 @@ function deriveObfuscationKey() {
 }
 
 /**
+ * Draws `size` random bytes, validating the generator's output.
+ *
+ * A silent RNG failure — a short or non-buffer return — would otherwise be
+ * stored as a plausible-looking but predictable credential.
+ *
+ * @param {number} size
+ * @returns {Buffer}
+ */
+function randomSecretBytes(size) {
+  const bytes = crypto.randomBytes(size);
+  if (!Buffer.isBuffer(bytes) || bytes.length !== size) {
+    throw new CredentialError(
+      'Secure random credential generation returned an invalid result',
+      CREDENTIAL_ERROR_INVALID_SECRET_VALUE
+    );
+  }
+  return bytes;
+}
+
+/**
  * Derives the obfuscation key for an explicit account and machine name.
  *
  * Exposed so that the cross-language parity tests can check a fixed vector
@@ -369,20 +389,83 @@ function checkRestrictedToCurrentUser(file) {
 }
 
 /**
- * Writes `contents` to `file` and enforces the owner-only restriction.
+ * Reports `file` as an invalid secrets file when it is a symlink/junction or
+ * any other non-regular entry.
+ *
+ * Credential paths are private files owned by this install. A planted redirect
+ * must not be followed to capture a secret written through it or to feed a
+ * forged secret back to the application.
+ *
+ * @param {string} file
+ */
+function rejectNonRegularEntry(file) {
+  let stat;
+  try {
+    stat = fs.lstatSync(file);
+  } catch (error) {
+    if (error && error.code === 'ENOENT') return;
+    throw new CredentialError(
+      `Could not inspect ${path.basename(file)}`,
+      CREDENTIAL_ERROR_INVALID_SECRETS_FILE,
+      file
+    );
+  }
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new CredentialError(
+      `${path.basename(file)} is not a regular file`,
+      CREDENTIAL_ERROR_INVALID_SECRETS_FILE,
+      file
+    );
+  }
+}
+
+/**
+ * Writes `contents` to `file` with protected-before-write semantics.
+ *
+ * The file is created exclusively (failing when it already exists), the
+ * owner-only restriction is established while the file is still empty, and
+ * only then are the secret bytes written and flushed. A plain
+ * write-then-restrict leaves a window in which the plaintext secret exists on
+ * disk readable by other principals. An `EEXIST` from the exclusive create is
+ * reported rather than overwritten: the existing bytes may be the only copy of
+ * a credential the datastore still accepts.
  *
  * @param {string} file
  * @param {string} contents
  */
 function writeSecretFile(file, contents) {
+  rejectNonRegularEntry(file);
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, contents, { encoding: 'utf8', mode: 0o600 });
-  if (!restrictToCurrentUser(file)) {
+  let fd;
+  try {
+    fd = fs.openSync(file, 'wx', 0o600);
+  } catch (error) {
+    if (error && error.code === 'EEXIST') {
+      throw new CredentialError(
+        `${path.basename(file)} already exists and was not created by this run; recovery is required`,
+        CREDENTIAL_ERROR_INVALID_SECRETS_FILE,
+        file
+      );
+    }
     throw new CredentialError(
-      `Could not restrict ${path.basename(file)} to the current user`,
-      CREDENTIAL_ERROR_PERMISSIONS_TOO_OPEN,
+      `Could not create ${path.basename(file)}`,
+      CREDENTIAL_ERROR_INVALID_SECRETS_FILE,
       file
     );
+  }
+  try {
+    // No secret bytes are written until protection succeeds.
+    if (!restrictToCurrentUser(file)) {
+      throw new CredentialError(
+        `Could not restrict ${path.basename(file)} to the current user`,
+        CREDENTIAL_ERROR_PERMISSIONS_TOO_OPEN,
+        file
+      );
+    }
+    fs.writeFileSync(fd, contents, 'utf8');
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
   }
 }
 
@@ -396,6 +479,7 @@ function writeSecretFile(file, contents) {
  * @returns {string | null} The contents, or null when the file is absent.
  */
 function readProtectedSecretFile(file) {
+  rejectNonRegularEntry(file);
   let contents;
   try {
     contents = fs.readFileSync(file, 'utf8');
@@ -609,7 +693,7 @@ function ensureDatabasePassword(dataDir) {
       secretsFile
     );
   }
-  const surrealPassword = crypto.randomBytes(DATABASE_PASSWORD_BYTES).toString('base64url');
+  const surrealPassword = randomSecretBytes(DATABASE_PASSWORD_BYTES).toString('base64url');
   writeSecretFile(
     secretsFile,
     `${JSON.stringify({ surrealPassword: encodeSecret(surrealPassword) }, null, 2)}\n`
@@ -687,7 +771,7 @@ function ensureEncryptionKey(dataDir) {
       keyFile
     );
   }
-  const key = crypto.randomBytes(ENCRYPTION_KEY_BYTES).toString('hex');
+  const key = randomSecretBytes(ENCRYPTION_KEY_BYTES).toString('hex');
   writeEncryptionKeyFile(keyFile, key);
   return key;
 }
@@ -723,6 +807,45 @@ function buildCredentialEnvironment(credentials) {
     SURREAL_PASSWORD: password,
     SURREAL_PASS: password,
   };
+}
+
+/**
+ * Builds operator-facing guidance for a credential failure.
+ *
+ * Each state has a distinct remedy, and the generic "review the service
+ * lifecycle diagnostics" message would send users to logs that cannot contain
+ * the fix. The messages are deliberately free of secret material. Non-credential
+ * errors fall through to the generic launcher guidance.
+ *
+ * @param {unknown} error The thrown error, which may carry a `code`.
+ * @returns {string}
+ */
+function credentialStartupMessage(error) {
+  switch (error && error.code) {
+    case CREDENTIAL_ERROR_INVALID_SECRETS_FILE:
+      return (
+        'The saved database credentials for this installation could not be read. ' +
+        'They have been left untouched so the existing notebook data is not put out of reach. ' +
+        'Restore the credentials file from a backup, or contact your administrator to run credential recovery.'
+      );
+    case CREDENTIAL_ERROR_INVALID_SECRET_VALUE:
+      return (
+        'The saved database credential for this installation is not a valid value. ' +
+        'It has been left untouched so the existing notebook data is not put out of reach. ' +
+        'Contact your administrator to run credential recovery.'
+      );
+    case CREDENTIAL_ERROR_PERMISSIONS_TOO_OPEN:
+      return (
+        'The saved database credentials are readable by other users on this computer. ' +
+        'The file has been left untouched. Restrict its permissions to your own account, or contact your administrator.'
+      );
+    case CREDENTIAL_ERROR_DATASTORE_UNREADABLE:
+      return (
+        'The notebook database could not be inspected. Check that no other process is using it, then try again.'
+      );
+    default:
+      return 'SERVICE_STARTUP_FAILED: Review the service lifecycle diagnostics.';
+  }
 }
 
 module.exports = {
@@ -769,4 +892,5 @@ module.exports = {
   CREDENTIAL_ERROR_PERMISSIONS_TOO_OPEN,
   CREDENTIAL_ERROR_DATASTORE_UNREADABLE,
   CREDENTIAL_ERROR_MIGRATION_REJECTED,
+  credentialStartupMessage,
 };

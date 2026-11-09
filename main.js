@@ -14,6 +14,7 @@ const fs = require('fs');
 const { startServices } = require('./scripts/start-services');
 const {
   ensureEncryptionKey,
+  credentialStartupMessage,
   resolveDatabaseCredentials,
 } = require('./scripts/lib/credentials');
 
@@ -50,40 +51,11 @@ function showErrorAndExit(title, message) {
 }
 
 /**
- * Builds operator-facing guidance for a credential failure.
- *
- * Each state has a distinct remedy, and the generic "review the service
- * lifecycle diagnostics" message would send users to logs that cannot contain
- * the fix. The messages are deliberately free of secret material.
+ * Operator-facing guidance for a credential failure is built by the shared
+ * credential module (`credentialStartupMessage`), so every host renders the
+ * same remedy for the same state. The messages are deliberately free of
+ * secret material.
  */
-function describeCredentialFailure(err) {
-  const code = err && err.code ? err.code : 'unknown';
-  switch (code) {
-    case 'invalid-secrets-file':
-      return (
-        'The saved database credentials for this installation could not be read. ' +
-        'They have been left untouched so the existing notebook data is not put out of reach. ' +
-        'Restore the credentials file from a backup, or contact your administrator to run credential recovery.'
-      );
-    case 'invalid-secret-value':
-      return (
-        'The saved database credential for this installation is not a valid value. ' +
-        'It has been left untouched so the existing notebook data is not put out of reach. ' +
-        'Contact your administrator to run credential recovery.'
-      );
-    case 'permissions-too-open':
-      return (
-        'The saved database credentials are readable by other users on this computer. ' +
-        'The file has been left untouched. Restrict its permissions to your own account, or contact your administrator.'
-      );
-    case 'datastore-unreadable':
-      return (
-        'The notebook database could not be inspected. Check that no other process is using it, then try again.'
-      );
-    default:
-      return 'SERVICE_STARTUP_FAILED: Review the service lifecycle diagnostics.';
-  }
-}
 
 /**
  * Resolves the credentials the app needs to start, or reports and exits.
@@ -108,7 +80,7 @@ function resolveCredentialsOrExit(dataDir) {
   } catch (err) {
     showErrorAndExit(
       'Office of Equity Open Notebook — database credentials unavailable',
-      describeCredentialFailure(err)
+      credentialStartupMessage(err)
     );
     return null;
   }
@@ -181,7 +153,7 @@ app.whenReady().then(async () => {
   } catch (err) {
     showErrorAndExit(
       'Office of Equity Open Notebook — encryption key unavailable',
-      describeCredentialFailure(err)
+      credentialStartupMessage(err)
     );
     return;
   }
@@ -195,13 +167,13 @@ app.whenReady().then(async () => {
       waitReady: true,
     });
   } catch (err) {
-    showErrorAndExit('Office of Equity Open Notebook — failed to start', 'SERVICE_STARTUP_FAILED: Review the service lifecycle diagnostics.');
+    showErrorAndExit('Office of Equity Open Notebook — failed to start', credentialStartupMessage(err));
     return;
   }
 
   createWindow();
-}).catch(() => {
-  showErrorAndExit('Office of Equity Open Notebook - failed to start', 'SERVICE_STARTUP_FAILED: Review the service lifecycle diagnostics.');
+}).catch((error) => {
+  showErrorAndExit('Office of Equity Open Notebook - failed to start', credentialStartupMessage(error));
 });
 
 app.on('window-all-closed', async () => {
