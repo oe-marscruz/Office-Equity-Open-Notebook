@@ -41,25 +41,83 @@ impl StaticFileServer {
         None
     }
 
+    /// Resolves a request path to a file under `root`, honouring how a Next.js
+    /// static export lays out its output:
+    ///
+    /// 1. exact file (`/_next/static/chunks/x.js`, `/config`, `/notebooks/index.txt`)
+    /// 2. directory index (`/notebooks/` -> `notebooks/index.html`)
+    /// 3. dynamic-route shell (`/notebooks/<id>/` -> `notebooks/_/index.html`)
+    ///
+    /// The export emits a single `_` placeholder document per dynamic segment
+    /// and the client resolves the real id from `location.pathname`. Without
+    /// step 3 a deep link would fall through to the root shell, which is the
+    /// wrong route tree, so the app would render the wrong page.
+    pub fn resolve_static_target(root: &Path, requested_path: &str) -> Option<PathBuf> {
+        let root = &fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let target = Self::validate_path_traversal(root, requested_path)?;
+
+        if target.is_file() {
+            return Some(target);
+        }
+
+        let index = target.join("index.html");
+        if index.is_file() {
+            return Some(index);
+        }
+
+        let clean_path = requested_path.split('?').next()?.split('#').next()?;
+        let segments: Vec<&str> = clean_path.split('/').filter(|s| !s.is_empty()).collect();
+        if segments.is_empty() {
+            return None;
+        }
+
+        // Depth-first walk matching each segment against the on-disk name or
+        // the export's `_` placeholder, keeping the deepest directory that
+        // contains an index.html.
+        let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+        let mut best: Option<(usize, PathBuf)> = None;
+
+        while let Some((dir, depth)) = stack.pop() {
+            if depth > 0 {
+                let index = dir.join("index.html");
+                if index.is_file() && best.as_ref().map_or(true, |(d, _)| depth > *d) {
+                    best = Some((depth, index));
+                }
+            }
+            if depth == segments.len() {
+                continue;
+            }
+
+            let segment = segments[depth];
+            let literal = dir.join(segment);
+            if literal.is_dir() {
+                stack.push((literal, depth + 1));
+            }
+            let placeholder = dir.join("_");
+            if !segment.is_empty() && segment != "_" && placeholder.is_dir() {
+                stack.push((placeholder, depth + 1));
+            }
+        }
+
+        best.map(|(_, path)| path)
+    }
+
     /// Serves static asset or applies SPA route fallback (`try_files $uri /index.html`).
     pub async fn handle_request(&self, req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
         let raw_path = req.uri().path();
 
         // 1. Path Traversal Security Check
-        let target_path = match Self::validate_path_traversal(&self.root_dir, raw_path) {
-            Some(p) => p,
-            None => {
-                let err_res = Response::builder()
-                    .status(StatusCode::FORBIDDEN)
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"error":"Forbidden: Path traversal sequence detected"}"#))
-                    .unwrap();
-                return Ok(err_res);
-            }
-        };
+        if Self::validate_path_traversal(&self.root_dir, raw_path).is_none() {
+            let err_res = Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"error":"Forbidden: Path traversal sequence detected"}"#))
+                .unwrap();
+            return Ok(err_res);
+        }
 
-        // 2. Check if file exists on disk
-        if target_path.is_file() {
+        // 2. Resolve to a real asset: exact file, directory index, or dynamic shell
+        if let Some(target_path) = Self::resolve_static_target(&self.root_dir, raw_path) {
             if let Ok(contents) = fs::read(&target_path) {
                 let mime = mime_guess::from_path(&target_path)
                     .first_raw()

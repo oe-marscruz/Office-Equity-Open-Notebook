@@ -22,5 +22,8 @@ resources/.testdata/
 # Compatibility-harness output (written by src-wails/contract_harness_test.go on every run)
 src-wails/compatibility-result-go.json
 
+# Frontend static-export build workspace (upstream sources + node_modules + next build cache)
+.artifacts/frontend-build/
+
 # Logs
 *.log
