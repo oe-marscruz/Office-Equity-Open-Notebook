@@ -1,79 +1,121 @@
+'use strict';
+
+const assert = require('assert/strict');
 const { spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { inventoryRuntime, assertRuntimeForPackaging } = require('../lib/runtime-evidence');
 
-const PROJECT_DIR = path.join(__dirname, '..', '..');
-const RUNTIME_SCRIPT = path.join(PROJECT_DIR, 'scripts', 'prepare-runtime.js');
-const TEMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'oen-upstream-lock-'));
-const LOCK_FILE = path.join(TEMP_DIR, 'upstream.lock.json');
-const RUNTIME_DIR = path.join(TEMP_DIR, 'runtime');
+const ROOT = path.resolve(__dirname, '../..');
+const suiteDir = fs.mkdtempSync(path.join(os.tmpdir(), 'oe-upstream-lock-'));
+const repo = path.join(suiteDir, 'source');
+const runtime = path.join(suiteDir, 'runtime');
+const lock = path.join(suiteDir, 'upstream.lock.json');
 
-// We need a dummy repo to run prepare-runtime.js
-const DUMMY_REPO = path.join(TEMP_DIR, 'repo');
-
-function setupDummyRepo() {
-  if (fs.existsSync(DUMMY_REPO)) fs.rmSync(DUMMY_REPO, { recursive: true, force: true });
-  fs.mkdirSync(DUMMY_REPO, { recursive: true });
-
-  // pyproject.toml is required by prepare-runtime.js
-  fs.writeFileSync(path.join(DUMMY_REPO, 'pyproject.toml'), '[project]\ndependencies = []');
-
-  // create dummy git repo
-  spawnSync('git', ['init'], { cwd: DUMMY_REPO });
-  spawnSync('git', ['config', 'user.email', 'test@example.com'], { cwd: DUMMY_REPO });
-  spawnSync('git', ['config', 'user.name', 'Test User'], { cwd: DUMMY_REPO });
-  fs.mkdirSync(path.join(DUMMY_REPO, 'open_notebook'));
-  fs.writeFileSync(path.join(DUMMY_REPO, 'open_notebook', 'config.py'), 'DATA_FOLDER = "./data"');
-  spawnSync('git', ['add', '.'], { cwd: DUMMY_REPO });
-  spawnSync('git', ['commit', '-m', 'initial commit'], { cwd: DUMMY_REPO });
-
-  const res = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: DUMMY_REPO, encoding: 'utf8' });
+function git(args) {
+  const res = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+  assert.equal(res.status, 0, res.stderr || res.error?.message);
   return res.stdout.trim();
 }
 
-const dummyCommit = setupDummyRepo();
-
-try {
-  console.log('Test 1: Fail closed on mismatch');
-  fs.writeFileSync(LOCK_FILE, JSON.stringify({ commit: 'mismatched-sha' }));
-  const res1 = spawnSync(process.execPath, [RUNTIME_SCRIPT, '--repo', DUMMY_REPO, '--step', 'backend', '--output', RUNTIME_DIR, '--lock-file', LOCK_FILE], { encoding: 'utf8' });
-  const err1 = res1.stderr || '';
-  if (res1.status === 0 || !err1.includes('Upstream commit mismatch')) {
-    throw new Error('Expected prepare-runtime.js to fail on mismatch, but it did not. Output:\n' + err1 + (res1.stdout || ''));
-  }
-  console.log('  -> Passed');
-
-  console.log('Test 2: Success with --override-upstream-check');
-  const res2 = spawnSync(process.execPath, [RUNTIME_SCRIPT, '--repo', DUMMY_REPO, '--step', 'backend', '--output', RUNTIME_DIR, '--lock-file', LOCK_FILE, '--override-upstream-check'], { encoding: 'utf8' });
-  const err2 = res2.stderr || '';
-  if (res2.status !== 0 || !err2.includes('Upstream commit mismatch overridden')) {
-    throw new Error('Expected prepare-runtime.js to succeed with override, but it failed. Output:\n' + err2 + '\n' + (res2.stdout || ''));
-  }
-  console.log('  -> Passed');
-
-  console.log('Test 3: Success on match');
-  fs.writeFileSync(LOCK_FILE, JSON.stringify({ commit: dummyCommit }));
-  const res3 = spawnSync(process.execPath, [RUNTIME_SCRIPT, '--repo', DUMMY_REPO, '--step', 'backend', '--output', RUNTIME_DIR, '--lock-file', LOCK_FILE], { encoding: 'utf8' });
-  const out3 = res3.stdout || '';
-  if (res3.status !== 0 || !out3.includes('Verified upstream commit')) {
-    throw new Error('Expected prepare-runtime.js to succeed on match, but it failed. Output:\n' + (res3.stderr || '') + '\n' + out3);
-  }
-  console.log('  -> Passed');
-
-  console.log('Test 4: Manifest generated successfully');
-  const manifestPath = path.join(RUNTIME_DIR, 'manifest.json');
-  if (!fs.existsSync(manifestPath)) {
-    throw new Error('Manifest file was not generated.');
-  }
-  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-  if (manifest.upstreamCommit !== dummyCommit) {
-    throw new Error(`Manifest has wrong upstreamCommit: expected ${dummyCommit}, got ${manifest.upstreamCommit}`);
-  }
-  console.log('  -> Passed');
-
-} finally {
-  fs.rmSync(TEMP_DIR, { recursive: true, force: true });
+function prepare(extra = [], output = runtime, step = 'backend') {
+  return spawnSync(process.execPath, [
+    path.join(ROOT, 'scripts/prepare-runtime.js'), '--repo', repo,
+    '--runtime-dir', output, '--lock-file', lock, '--step', step, ...extra,
+  ], { encoding: 'utf8' });
 }
 
-console.log('All tests passed.');
+async function defaultSnapshot() {
+  const runtimeDir = path.join(ROOT, 'resources/runtime');
+  const manifest = path.join(runtimeDir, 'manifest.json');
+  return {
+    lock: fs.readFileSync(path.join(ROOT, 'upstream.lock.json'), 'utf8'),
+    files: fs.existsSync(runtimeDir) ? await inventoryRuntime(runtimeDir) : null,
+    manifest: fs.existsSync(manifest) ? fs.readFileSync(manifest, 'utf8') : null,
+  };
+}
+
+async function main() {
+  const before = await defaultSnapshot();
+  try {
+    fs.mkdirSync(path.join(repo, 'open_notebook'), { recursive: true });
+    fs.writeFileSync(path.join(repo, 'pyproject.toml'), '[project]\ndependencies = []\n');
+    fs.writeFileSync(path.join(repo, 'open_notebook/config.py'), 'DATA_FOLDER = "./data"\n');
+    fs.writeFileSync(path.join(repo, '.gitignore'), 'ignored.py\n');
+    fs.writeFileSync(path.join(repo, 'open_notebook/ignored.py'), '# ignored local file');
+    git(['init']);
+    git(['add', '.']);
+    git(['-c', 'user.email=test@example.invalid', '-c', 'user.name=Fixture', 'commit', '-m', 'synthetic fixture']);
+    const commit = git(['rev-parse', 'HEAD']);
+
+    fs.writeFileSync(lock, JSON.stringify({ commit: '0'.repeat(40) }));
+    let result = prepare();
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Upstream commit mismatch/);
+    assert.equal(fs.existsSync(runtime), false, 'Rejected pin must not mutate output.');
+
+    result = prepare(['--override-upstream-check']);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stderr, /ineligible for packaging/);
+    let manifest = JSON.parse(fs.readFileSync(path.join(runtime, 'manifest.json'), 'utf8'));
+    assert.equal(manifest.upstreamPinMatched, false);
+    assert.equal(manifest.assemblyComplete, false);
+    await assert.rejects(assertRuntimeForPackaging(runtime, lock), /packaging blocked/);
+
+    fs.writeFileSync(lock, JSON.stringify({ commit }));
+    result = prepare();
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Verified upstream commit/);
+    assert.match(result.stdout, /Partial inventory only/);
+    manifest = JSON.parse(fs.readFileSync(path.join(runtime, 'manifest.json'), 'utf8'));
+    assert.equal(manifest.upstreamCommit, commit);
+    assert.equal(manifest.upstreamPinMatched, true);
+    assert.equal(manifest.upstreamWorkingTreeClean, true);
+    assert.deepEqual(manifest.completedSteps, ['backend']);
+    assert.equal(manifest.assemblyComplete, false);
+    assert.equal(manifest.files.length, 1);
+    assert.match(manifest.files[0].sha256, /^[a-f0-9]{64}$/);
+    assert.match(fs.readFileSync(path.join(runtime, 'backend/open_notebook/config.py'), 'utf8'), /^import os\n/);
+    await assert.rejects(assertRuntimeForPackaging(runtime, lock), /partial/);
+
+    assert.equal(fs.existsSync(path.join(runtime, 'backend/open_notebook/ignored.py')), false);
+    const linked = path.join(suiteDir, 'linked-output');
+    fs.symlinkSync(repo, linked, process.platform === 'win32' ? 'junction' : 'dir');
+    result = prepare([], linked);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /overlaps protected/);
+    fs.unlinkSync(linked);
+
+    const manifestBeforeDirty = fs.readFileSync(path.join(runtime, 'manifest.json'), 'utf8');
+    fs.appendFileSync(path.join(repo, 'open_notebook/config.py'), '# dirty\n');
+    result = prepare();
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /dirty source/);
+    assert.equal(fs.readFileSync(path.join(runtime, 'manifest.json'), 'utf8'), manifestBeforeDirty);
+
+    result = prepare([], path.join(ROOT, 'resources/runtime'));
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /alternate lock requires an isolated/);
+
+    // A build failure after preflight invalidates the old manifest.
+    fs.writeFileSync(path.join(repo, 'open_notebook/config.py'), '# incompatible upstream config\n');
+    result = prepare(['--override-upstream-check']);
+    assert.notEqual(result.status, 0);
+    assert.equal(fs.existsSync(path.join(runtime, 'manifest.json')), false);
+    fs.mkdirSync(path.join(runtime, 'surreal'), { recursive: true });
+    fs.writeFileSync(path.join(runtime, 'surreal/surreal.exe'), 'corrupt cached binary');
+    result = prepare(['--override-upstream-check'], runtime, 'surreal');
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /Checksum mismatch for cached SurrealDB/);
+    assert.equal(fs.existsSync(path.join(runtime, 'manifest.json')), false);
+    assert.deepEqual(await defaultSnapshot(), before, 'Fixture tests must leave production lock/runtime unchanged.');
+    console.log('Upstream pin, partial/override rejection, failed-build invalidation and fixture isolation passed.');
+  } finally {
+    const relative = path.relative(os.tmpdir(), suiteDir);
+    assert.ok(relative.startsWith('oe-upstream-lock-') && !relative.includes(path.sep));
+    fs.rmSync(suiteDir, { recursive: true, force: true });
+  }
+}
+
+main().catch((err) => { console.error(err); process.exitCode = 1; });

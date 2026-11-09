@@ -17,6 +17,7 @@
 
 const { spawnSync } = require('child_process');
 const fs = require('fs');
+const { assertRuntimeForPackaging } = require('./lib/runtime-evidence');
 const path = require('path');
 const os = require('os');
 
@@ -53,7 +54,8 @@ function runRobocopy(args) {
   }
 }
 
-function main() {
+async function main() {
+  await assertRuntimeForPackaging(path.join(APP_DIR, 'resources/runtime'), path.join(PROJECT_DIR, 'upstream.lock.json'));
   if (!fs.existsSync(path.join(APP_DIR, `${PRODUCT_NAME}.exe`))) {
     console.error(`Packaged app not found at ${APP_DIR}. Run \`npm run package:app\` first.`);
     process.exit(1);
@@ -155,4 +157,4 @@ SectionEnd
   }
 }
 
-main();
+main().catch((err) => { console.error(err.message); process.exitCode = 1; });
