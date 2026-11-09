@@ -3,6 +3,18 @@
 ## Current Packet
 `Security hardening re-port` (Completed — per-install credential store across all five hosts)
 
+## FERPA Hardening Queue
+The modernization initiative (L0.1–L8.5) is closed. The separate FERPA hardening queue (F01–F18) is tracked in `docs/compliance/ferpa/IMPLEMENTATION_STATUS.md` and is **not** complete.
+
+- `F01`: Source inventory and task mapping. (Completed)
+- `F02`: Prevent unsupported security assurance. (Completed — fixture-scoped, compliance claims rejected)
+- `F03`: Service diagnostics minimization. (Implemented and component-tested; installed-application acceptance open)
+- `F04`: Per-install database credentials and legacy migration. (Implemented and contract-tested — least privilege, at-rest encryption, key rotation and end-to-end runtime verification open)
+- `F05`: Assembled upstream backend. (Revision pinned and CI-verified; assembly never performed — `resources/runtime/` absent)
+- `F06`–`F18`: Open. F06, F09, F10, F14 and F18 are hard-blocked on F05.
+
+Remaining planning allowance is roughly 40–80 engineer-days at ~10–15% complete by effort, excluding approvals and external assessment. Highest-leverage next task is F05's assembled backend; second is packaged-application acceptance for F03.
+
 ## Completed Packets
 - `L0.1`: Pin upstream revision and build provenance. (Completed)
 - `L0.2`: Capture untouched baseline build and metrics. (Completed)
@@ -52,6 +64,9 @@
 - Architecture and operations documentation compiled at `docs/modernization/ARCHITECTURE_OPERATIONS.md`.
 - Final empirical benchmark scorecard saved at `.artifacts/reports/l8_5/final_scorecard_and_operations.json`.
 - All 29 automated mechanical test suites passing successfully via `node scripts/orchestrator/verifier.js`.
+
+> The suite count and "initiative complete" claim above describe the modernization scope only. Re-verified on 2026-11-09 on the credential re-port branch: `npm run build:types` PASS and `node scripts/orchestrator/verifier.js` PASS with **30/30** suites (the credential re-port added two). These green checks cover contract and synthetic-fixture suites, not an installed application, an assembled backend, or any Azure tenant.
+
 
 ## Security Hardening Re-port
 - The fixed SurrealDB `root`/`root` credential was replaced with a per-install random password, stored obfuscated and ACL-restricted to the current OS user.
