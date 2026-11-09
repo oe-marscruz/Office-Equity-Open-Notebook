@@ -210,8 +210,15 @@ export interface BackendEnvironment extends Record<string, string | undefined> {
  *   the host has to run the migration instead of quietly connecting as `root`.
  * - `stored`: the password was read back from `secrets.json`.
  * - `generated`: a new random password was created for this install.
+ * - `migrated`: this process is the one that just rotated a legacy install
+ *   onto a provisioned password. Provenance, not state: the next launch reads
+ *   the same password back and reports `stored`.
  */
-export type DatabaseCredentialSource = 'legacy-unmigrated' | 'stored' | 'generated';
+export type DatabaseCredentialSource =
+  | 'legacy-unmigrated'
+  | 'stored'
+  | 'generated'
+  | 'migrated';
 
 /**
  * Stable failure codes for the credential store.
@@ -223,7 +230,8 @@ export type DatabaseCredentialErrorCode =
   | 'invalid-secrets-file'
   | 'invalid-secret-value'
   | 'permissions-too-open'
-  | 'datastore-unreadable';
+  | 'datastore-unreadable'
+  | 'migration-rejected';
 
 export interface DatabaseCredentials {
   /** The SurrealDB root user name. Fixed, because it is not a secret. */
@@ -234,7 +242,7 @@ export interface DatabaseCredentials {
    */
   password: string | null;
   /** True when the install still needs credential migration. */
-  legacy: boolean;
+  migrationRequired: boolean;
   /** Provenance of the resolved password. */
   source: DatabaseCredentialSource;
 }

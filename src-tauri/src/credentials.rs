@@ -28,6 +28,11 @@
 //! [`CredentialSource::LegacyUnmigrated`] with no password, so the caller has
 //! to run the migration instead of quietly connecting as `root`.
 //!
+//! The migration itself is owned by `scripts/lib/credential-migration.js`, which
+//! probes the datastore with the historical password once, rotates it, and only
+//! then persists it. This host deliberately carries no copy of that probe
+//! password: a second copy would be a second thing to forget to remove.
+//!
 //! Obfuscation does not authenticate stored values, so some corruption cannot
 //! be detected without changing the shared on-disk format.
 //!
@@ -58,8 +63,6 @@ use sha2::{Digest, Sha256};
 pub const KEY_FILENAME: &str = "encryption-key.txt";
 /// File holding the obfuscated SurrealDB root password.
 pub const SECRETS_FILENAME: &str = "secrets.json";
-/// The root password used by builds that predate per-install credentials.
-pub const LEGACY_DATABASE_PASSWORD: &str = "root";
 /// The SurrealDB root username. Fixed, because it is not itself a secret.
 pub const DATABASE_USER: &str = "root";
 
@@ -87,6 +90,13 @@ pub enum CredentialSource {
     Stored,
     /// The password was generated on this run.
     Generated,
+    /// The password was provisioned by rotating a legacy datastore to a
+    /// per-install credential.
+    ///
+    /// This describes the migration that produced the password, not the state of
+    /// a later launch: once the password is persisted, later resolutions report
+    /// [`CredentialSource::Stored`].
+    Migrated,
 }
 
 /// The SurrealDB credentials to start the database with.
@@ -97,7 +107,7 @@ pub struct DatabaseCredentials {
     /// The SurrealDB password, absent until the install has been migrated.
     pub password: Option<String>,
     /// True when the install still needs credential migration.
-    pub legacy: bool,
+    pub migration_required: bool,
     /// Where the password came from.
     pub source: CredentialSource,
 }
@@ -464,13 +474,13 @@ pub fn resolve_database_credentials(data_dir: &Path) -> Result<DatabaseCredentia
         return Ok(DatabaseCredentials {
             user: DATABASE_USER.to_string(),
             password: None,
-            legacy: true,
+            migration_required: true,
             source: CredentialSource::LegacyUnmigrated,
         });
     }
     let password = ensure_database_password(data_dir)?;
     Ok(DatabaseCredentials {
-        user: DATABASE_USER.to_string(), password: Some(password), legacy: false,
+        user: DATABASE_USER.to_string(), password: Some(password), migration_required: false,
         source: if existed { CredentialSource::Stored } else { CredentialSource::Generated },
     })
 }
@@ -552,7 +562,14 @@ mod tests {
     fn error_code(message: &str) -> &'static str {
         match message {
             "Credential file permissions are too open" => "permissions-too-open",
-            "Could not inspect datastore" => "datastore-unreadable",
+            "Could not inspect datastore"
+            | "The datastore exists but could not be reached to migrate its credentials"
+            | "The datastore exists but could not be reached to complete its credential migration"
+            | "The datastore exists but no database connection was supplied to migrate its credentials" => {
+                "datastore-unreadable"
+            }
+            "The existing datastore does not accept the legacy credential; an operator must supply its current password"
+            | "Credential rotation failed; the existing datastore is unchanged" => "migration-rejected",
             "Invalid database credential file"
             | "Existing datastore has no credential file; recovery is required" => {
                 "invalid-secrets-file"
@@ -655,7 +672,7 @@ mod tests {
         let dir = tempdir("fresh");
         let credentials = resolve_database_credentials(&dir).unwrap();
         assert_eq!(credentials.user, DATABASE_USER);
-        assert!(!credentials.legacy);
+        assert!(!credentials.migration_required);
         assert_eq!(credentials.source, CredentialSource::Generated);
         let password = credentials.password.expect("password");
         assert!(!password.is_empty());
@@ -674,7 +691,7 @@ mod tests {
         let credentials = resolve_database_credentials(&dir).expect("legacy state, not an error");
         assert_eq!(credentials.user, DATABASE_USER);
         assert_eq!(credentials.password, None);
-        assert!(credentials.legacy);
+        assert!(credentials.migration_required);
         assert_eq!(credentials.source, CredentialSource::LegacyUnmigrated);
 
         // The callers must not be able to turn the state into a usable
@@ -739,7 +756,7 @@ mod tests {
         let environment = build_credential_environment(&DatabaseCredentials {
             user: DATABASE_USER.to_string(),
             password: Some("s3cr3t".to_string()),
-            legacy: false,
+            migration_required: false,
             source: CredentialSource::Generated,
         })
         .expect("environment");
@@ -754,7 +771,7 @@ mod tests {
             let result = build_credential_environment(&DatabaseCredentials {
                 user: DATABASE_USER.to_string(),
                 password: Some(password),
-                legacy: false,
+                migration_required: false,
                 source: CredentialSource::Stored,
             });
             assert!(result.is_err(), "a control character or empty value is unusable");
@@ -816,7 +833,11 @@ mod tests {
                     state["source"].as_str().expect("source"),
                     "{id}: source"
                 );
-                assert_eq!(credentials.legacy, state["legacy"].as_bool().expect("legacy"), "{id}: legacy");
+                assert_eq!(
+                    credentials.migration_required,
+                    state["migrationRequired"].as_bool().expect("migrationRequired"),
+                    "{id}: migrationRequired"
+                );
                 assert_eq!(
                     credentials.password.is_some(),
                     state["passwordAvailable"].as_bool().expect("passwordAvailable"),
@@ -848,6 +869,7 @@ mod tests {
             CredentialSource::LegacyUnmigrated => "legacy-unmigrated",
             CredentialSource::Stored => "stored",
             CredentialSource::Generated => "generated",
+            CredentialSource::Migrated => "migrated",
         }
     }
 

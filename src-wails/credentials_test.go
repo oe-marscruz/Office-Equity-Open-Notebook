@@ -28,10 +28,10 @@ type credentialCases struct {
 		Hostname string `json:"hostname"`
 		KeyHex   string `json:"keyHex"`
 	} `json:"derivationVectors"`
-	Sources     []string          `json:"sources"`
-	ErrorCodes  map[string]string `json:"errorCodes"`
-	AclSamples  []aclSample       `json:"aclSamples"`
-	States      []credentialState `json:"states"`
+	Sources    []string          `json:"sources"`
+	ErrorCodes map[string]string `json:"errorCodes"`
+	AclSamples []aclSample       `json:"aclSamples"`
+	States     []credentialState `json:"states"`
 }
 
 // aclSample is one icacls listing or POSIX mode from the fixture.
@@ -47,17 +47,17 @@ type aclSample struct {
 // credentialState is one on-disk situation every host has to report the same
 // way.
 type credentialState struct {
-	ID               string  `json:"id"`
-	Description      string  `json:"description"`
-	Datastore        string  `json:"datastore"`
-	Secrets          string  `json:"secrets"`
-	ACL              string  `json:"acl"`
-	Outcome          string  `json:"outcome"`
-	Source           *string `json:"source"`
-	Legacy           bool    `json:"legacy"`
-	PasswordAvailable bool   `json:"passwordAvailable"`
-	WritesSecretsFile bool   `json:"writesSecretsFile"`
-	ErrorCode        *string `json:"errorCode"`
+	ID                string  `json:"id"`
+	Description       string  `json:"description"`
+	Datastore         string  `json:"datastore"`
+	Secrets           string  `json:"secrets"`
+	ACL               string  `json:"acl"`
+	Outcome           string  `json:"outcome"`
+	Source            *string `json:"source"`
+	MigrationRequired bool    `json:"migrationRequired"`
+	PasswordAvailable bool    `json:"passwordAvailable"`
+	WritesSecretsFile bool    `json:"writesSecretsFile"`
+	ErrorCode         *string `json:"errorCode"`
 }
 
 func loadCredentialCases(t *testing.T) credentialCases {
@@ -166,8 +166,8 @@ func TestFreshInstallGeneratesRandomPassword(t *testing.T) {
 	if credentials.User != DatabaseUser {
 		t.Errorf("user = %q, want %q", credentials.User, DatabaseUser)
 	}
-	if credentials.Legacy {
-		t.Error("fresh install must not use the legacy credential")
+	if credentials.MigrationRequired {
+		t.Error("fresh install must not require migration")
 	}
 	if credentials.Source != CredentialSourceGenerated {
 		t.Errorf("source = %q, want %q", credentials.Source, CredentialSourceGenerated)
@@ -199,7 +199,7 @@ func TestExistingDatastoreIsReportedAsUnmigrated(t *testing.T) {
 	if credentials.Password != nil {
 		t.Errorf("password = %q, want no password", *credentials.Password)
 	}
-	if !credentials.Legacy {
+	if !credentials.MigrationRequired {
 		t.Error("a datastore without a secrets file is an unmigrated install")
 	}
 	if credentials.Source != CredentialSourceLegacyUnmigrated {
@@ -382,8 +382,8 @@ func TestEverySharedCredentialStateMatchesTheFixture(t *testing.T) {
 				if state.Source == nil || string(credentials.Source) != *state.Source {
 					t.Fatalf("source = %q, want %v", credentials.Source, state.Source)
 				}
-				if credentials.Legacy != state.Legacy {
-					t.Errorf("legacy = %v, want %v", credentials.Legacy, state.Legacy)
+				if credentials.MigrationRequired != state.MigrationRequired {
+					t.Errorf("migrationRequired = %v, want %v", credentials.MigrationRequired, state.MigrationRequired)
 				}
 				if (credentials.Password != nil) != state.PasswordAvailable {
 					t.Errorf("password available = %v, want %v", credentials.Password != nil, state.PasswordAvailable)
@@ -446,6 +446,7 @@ func TestCredentialErrorCodesAndSourcesMatchTheFixture(t *testing.T) {
 		"invalidSecretValue":  CredentialErrorInvalidSecretValue,
 		"permissionsTooOpen":  CredentialErrorPermissionsTooOpen,
 		"datastoreUnreadable": CredentialErrorDatastoreUnreadable,
+		"migrationRejected":   CredentialErrorMigrationRejected,
 	}
 	for name, value := range declared {
 		want, ok := cases.ErrorCodes[name]
@@ -461,6 +462,7 @@ func TestCredentialErrorCodesAndSourcesMatchTheFixture(t *testing.T) {
 		CredentialSourceLegacyUnmigrated,
 		CredentialSourceStored,
 		CredentialSourceGenerated,
+		CredentialSourceMigrated,
 	} {
 		found := false
 		for _, declared := range cases.Sources {

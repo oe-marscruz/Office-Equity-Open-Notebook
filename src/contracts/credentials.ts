@@ -19,6 +19,7 @@
 
 import path from 'path';
 import credentialsModule from '../../scripts/lib/credentials';
+import migrationModule from '../../scripts/lib/credential-migration';
 import {
   CredentialEnvironment,
   CredentialStoreLayout,
@@ -28,12 +29,12 @@ import {
   DatabaseCredentials,
 } from '../types';
 
+/** The probe password a legacy datastore is offered once, before migration. */
+export const LEGACY_PROBE_PASSWORD: string = migrationModule.LEGACY_PROBE_PASSWORD;
+
 /** File names of the on-disk secret store. */
 export const KEY_FILENAME: string = credentialsModule.KEY_FILENAME;
 export const SECRETS_FILENAME: string = credentialsModule.SECRETS_FILENAME;
-
-/** The fixed password used by installs that predate per-install credentials. */
-export const LEGACY_DATABASE_PASSWORD: string = credentialsModule.LEGACY_DATABASE_PASSWORD;
 
 /** The SurrealDB root user name. Fixed, because it is not itself a secret. */
 export const DATABASE_USER: string = credentialsModule.DATABASE_USER;
@@ -45,6 +46,8 @@ export const CREDENTIAL_SOURCE_STORED: DatabaseCredentialSource =
   credentialsModule.CREDENTIAL_SOURCE_STORED as DatabaseCredentialSource;
 export const CREDENTIAL_SOURCE_GENERATED: DatabaseCredentialSource =
   credentialsModule.CREDENTIAL_SOURCE_GENERATED as DatabaseCredentialSource;
+export const CREDENTIAL_SOURCE_MIGRATED: DatabaseCredentialSource =
+  credentialsModule.CREDENTIAL_SOURCE_MIGRATED as DatabaseCredentialSource;
 
 /** The failure codes shared by every host. */
 export const CREDENTIAL_ERROR_INVALID_SECRETS_FILE: DatabaseCredentialErrorCode =
@@ -55,6 +58,8 @@ export const CREDENTIAL_ERROR_PERMISSIONS_TOO_OPEN: DatabaseCredentialErrorCode 
   credentialsModule.CREDENTIAL_ERROR_PERMISSIONS_TOO_OPEN as DatabaseCredentialErrorCode;
 export const CREDENTIAL_ERROR_DATASTORE_UNREADABLE: DatabaseCredentialErrorCode =
   credentialsModule.CREDENTIAL_ERROR_DATASTORE_UNREADABLE as DatabaseCredentialErrorCode;
+export const CREDENTIAL_ERROR_MIGRATION_REJECTED: DatabaseCredentialErrorCode =
+  credentialsModule.CREDENTIAL_ERROR_MIGRATION_REJECTED as DatabaseCredentialErrorCode;
 
 /** Marker prefix identifying an obfuscated value in a secret file. */
 export const OBFUSCATION_PREFIX: string = credentialsModule.OBFUSCATION_PREFIX;
@@ -86,7 +91,8 @@ export function describeCredentialStore(dataDir: string): CredentialStoreLayout 
  * @throws {Error} Carrying one of the `DatabaseCredentialErrorCode` values.
  */
 export function resolveDatabaseCredentials(dataDir: string): DatabaseCredentials {
-  return credentialsModule.resolveDatabaseCredentials(dataDir) as DatabaseCredentials;
+  const resolved = credentialsModule.resolveDatabaseCredentials(dataDir);
+  return resolved as unknown as DatabaseCredentials;
 }
 
 /**

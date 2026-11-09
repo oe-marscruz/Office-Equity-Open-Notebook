@@ -74,9 +74,6 @@ const (
 	KeyFilename = "encryption-key.txt"
 	// SecretsFilename holds the obfuscated SurrealDB root password.
 	SecretsFilename = "secrets.json"
-	// LegacyDatabasePassword is the root password used by builds that predate
-	// per-install credentials.
-	LegacyDatabasePassword = "root"
 	// DatabaseUser is the SurrealDB root username. Fixed, because it is not
 	// itself a secret.
 	DatabaseUser = "root"
@@ -109,6 +106,10 @@ const (
 	CredentialSourceStored CredentialSource = "stored"
 	// CredentialSourceGenerated means the password was generated this run.
 	CredentialSourceGenerated CredentialSource = "generated"
+	// CredentialSourceMigrated means this process rotated a legacy install onto
+	// a provisioned password. It is provenance, not state: the next launch
+	// reads the same password back and reports CredentialSourceStored.
+	CredentialSourceMigrated CredentialSource = "migrated"
 )
 
 // The failure modes every host reports for the same on-disk situation.
@@ -117,6 +118,10 @@ const (
 	CredentialErrorInvalidSecretValue  = "invalid-secret-value"
 	CredentialErrorPermissionsTooOpen  = "permissions-too-open"
 	CredentialErrorDatastoreUnreadable = "datastore-unreadable"
+	// CredentialErrorMigrationRejected means the datastore exists but does not
+	// accept the legacy probe password, so nothing was rotated and nothing was
+	// written. An operator has to supply the current password.
+	CredentialErrorMigrationRejected = "migration-rejected"
 )
 
 // CredentialError is a credential failure with a machine-readable code, so
@@ -149,8 +154,10 @@ func newCredentialError(code, message, path string) error {
 type DatabaseCredentials struct {
 	User     string
 	Password *string
-	Legacy   bool
-	Source   CredentialSource
+	// MigrationRequired is true when the datastore has not been provisioned
+	// with a per-install password yet.
+	MigrationRequired bool
+	Source            CredentialSource
 }
 
 // CredentialEnvironment holds the environment variables that carry database
@@ -566,10 +573,10 @@ func ResolveDatabaseCredentials(dataDir string) (DatabaseCredentials, error) {
 		}
 		if found {
 			return DatabaseCredentials{
-				User:     DatabaseUser,
-				Password: nil,
-				Legacy:   true,
-				Source:   CredentialSourceLegacyUnmigrated,
+				User:              DatabaseUser,
+				Password:          nil,
+				MigrationRequired: true,
+				Source:            CredentialSourceLegacyUnmigrated,
 			}, nil
 		}
 	}
@@ -583,10 +590,10 @@ func ResolveDatabaseCredentials(dataDir string) (DatabaseCredentials, error) {
 		source = CredentialSourceStored
 	}
 	return DatabaseCredentials{
-		User:     DatabaseUser,
-		Password: &password,
-		Legacy:   false,
-		Source:   source,
+		User:              DatabaseUser,
+		Password:          &password,
+		MigrationRequired: false,
+		Source:            source,
 	}, nil
 }
 

@@ -30,6 +30,16 @@ namespace OfficeEquityOpenNotebook
 
         /// <summary>The password was generated on this run.</summary>
         Generated,
+
+        /// <summary>
+        /// The password was provisioned by rotating a legacy datastore to a
+        /// per-install credential.
+        ///
+        /// This describes the migration that produced the password, not the
+        /// state of a later launch: once the password is persisted, subsequent
+        /// resolutions report <see cref="Stored"/>.
+        /// </summary>
+        Migrated,
     }
 
     /// <summary>
@@ -40,6 +50,7 @@ namespace OfficeEquityOpenNotebook
         public const string LegacyUnmigrated = "legacy-unmigrated";
         public const string Stored = "stored";
         public const string Generated = "generated";
+        public const string Migrated = "migrated";
 
         /// <summary>Renders a source as its cross-host identifier.</summary>
         public static string ToIdentifier(CredentialSource source)
@@ -49,6 +60,7 @@ namespace OfficeEquityOpenNotebook
                 CredentialSource.LegacyUnmigrated => LegacyUnmigrated,
                 CredentialSource.Stored => Stored,
                 CredentialSource.Generated => Generated,
+                CredentialSource.Migrated => Migrated,
                 _ => throw new ArgumentOutOfRangeException(nameof(source)),
             };
         }
@@ -66,6 +78,13 @@ namespace OfficeEquityOpenNotebook
         public const string InvalidSecretValue = "invalid-secret-value";
         public const string PermissionsTooOpen = "permissions-too-open";
         public const string DatastoreUnreadable = "datastore-unreadable";
+
+        /// <summary>
+        /// A legacy datastore rejected the historical probe password, so an
+        /// operator has to supply its current password. The datastore is left
+        /// untouched: it is the only place that password still exists.
+        /// </summary>
+        public const string MigrationRejected = "migration-rejected";
     }
 
     /// <summary>
@@ -103,7 +122,7 @@ namespace OfficeEquityOpenNotebook
         public string? Password { get; set; }
 
         /// <summary>True when the install needs an explicit credential migration.</summary>
-        public bool Legacy { get; set; }
+        public bool MigrationRequired { get; set; }
 
         /// <summary>Where the password came from.</summary>
         public CredentialSource Source { get; set; }
@@ -196,19 +215,6 @@ namespace OfficeEquityOpenNotebook
 
         /// <summary>File holding the obfuscated SurrealDB root password.</summary>
         public const string SecretsFilename = "secrets.json";
-
-        /// <summary>
-        /// The fixed password written by builds that predate per-install
-        /// credentials.
-        ///
-        /// Retained only so the migration path can explicitly ask to try it
-        /// once against an existing datastore. No resolution path returns this
-        /// value: <see cref="ResolveDatabaseCredentials"/> reports
-        /// <see cref="CredentialSource.LegacyUnmigrated"/> with a null password
-        /// instead, so a caller that forgets to handle migration fails loudly
-        /// rather than quietly connecting as root.
-        /// </summary>
-        public const string LegacyDatabasePassword = "root";
 
         /// <summary>The SurrealDB root username. Fixed, because it is not itself a secret.</summary>
         public const string DatabaseUser = "root";
@@ -943,6 +949,14 @@ namespace OfficeEquityOpenNotebook
         ///     exists, no secrets file. The install predates per-install
         ///     credentials and needs an explicit migration; no password is
         ///     returned.
+        ///
+        /// A migration rotates the datastore to a provisioned password and only
+        /// then persists it, so <see cref="CredentialSource.Migrated"/> is reported
+        /// for the launch that performed the rotation; later launches report
+        /// <see cref="CredentialSource.Stored"/>. The probe password a legacy
+        /// datastore is offered once lives in scripts/lib/credential-migration.js,
+        /// which owns the migration for every host; this file deliberately keeps
+        /// no copy of it.
         /// </summary>
         /// <exception cref="CredentialException">
         /// The credential state cannot be established safely.
@@ -958,7 +972,7 @@ namespace OfficeEquityOpenNotebook
                 {
                     User = DatabaseUser,
                     Password = null,
-                    Legacy = true,
+                    MigrationRequired = true,
                     Source = CredentialSource.LegacyUnmigrated,
                 };
             }
@@ -968,7 +982,7 @@ namespace OfficeEquityOpenNotebook
             {
                 User = DatabaseUser,
                 Password = password,
-                Legacy = false,
+                MigrationRequired = false,
                 Source = hadSecrets ? CredentialSource.Stored : CredentialSource.Generated,
             };
         }

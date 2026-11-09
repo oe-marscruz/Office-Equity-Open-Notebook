@@ -34,13 +34,16 @@
  *
  * Credential states
  * -----------------
- * Every host classifies an install into one of three states, defined by the
+ * Every host classifies an install into one of four states, defined by the
  * shared fixture in `tests/contracts/credentials-cases.json`:
  *
  *   - `generated`          — a fresh install; a random password was created.
  *   - `stored`             — the password was read back from `secrets.json`.
+ *   - `migrated`           — provisioned by the one-time migration described
+ *                            in `credential-migration.js`.
  *   - `legacy-unmigrated`  — a datastore exists but `secrets.json` does not, so
- *                            the install predates per-install credentials.
+ *                            the install predates per-install credentials and
+ *                            has not been migrated yet.
  *
  * The last state carries *no* password. Returning the fixed `root` string
  * would hide the legacy case behind a value that looks like a real credential;
@@ -89,11 +92,15 @@ const DATABASE_PASSWORD_BYTES = 24;
 const CREDENTIAL_SOURCE_LEGACY_UNMIGRATED = 'legacy-unmigrated';
 const CREDENTIAL_SOURCE_STORED = 'stored';
 const CREDENTIAL_SOURCE_GENERATED = 'generated';
+/** Provisioned by a one-time migration of a datastore that predates per-install credentials. */
+const CREDENTIAL_SOURCE_MIGRATED = 'migrated';
 
 const CREDENTIAL_ERROR_INVALID_SECRETS_FILE = 'invalid-secrets-file';
 const CREDENTIAL_ERROR_INVALID_SECRET_VALUE = 'invalid-secret-value';
 const CREDENTIAL_ERROR_PERMISSIONS_TOO_OPEN = 'permissions-too-open';
 const CREDENTIAL_ERROR_DATASTORE_UNREADABLE = 'datastore-unreadable';
+/** The datastore exists but does not accept the credential the migration offered it. */
+const CREDENTIAL_ERROR_MIGRATION_REJECTED = 'migration-rejected';
 
 /**
  * Thrown when the credential store cannot be used safely.
@@ -116,16 +123,14 @@ class CredentialError extends Error {
   }
 }
 
-/**
- * The fixed password written by builds that predate per-install credentials.
- *
- * Retained only so the migration path can *explicitly* ask to try it once
- * against an existing datastore. No resolution path returns this value:
- * `resolveDatabaseCredentials` reports `legacy-unmigrated` with a null
- * password instead, so a caller that forgets to handle migration fails loudly
- * rather than quietly connecting as `root`.
- */
-const LEGACY_DATABASE_PASSWORD = 'root';
+// The fixed password written by builds that predate per-install credentials is
+// deliberately not defined here. The one place that may name it is the
+// migration probe in `credential-migration.js`, which offers it to an existing
+// datastore once to decide whether that datastore is a legacy one. No
+// resolution path can return it: `resolveDatabaseCredentials` reports
+// `legacy-unmigrated` with a null password instead, so a caller that forgets to
+// handle migration fails loudly rather than quietly connecting as `root`.
+
 /** The SurrealDB root username. Fixed, because it is not itself a secret. */
 const DATABASE_USER = 'root';
 
@@ -622,11 +627,16 @@ function ensureDatabasePassword(dataDir) {
  *   - `generated`         — fresh install, random password created.
  *   - `stored`            — password read back from `secrets.json`.
  *   - `legacy-unmigrated` — datastore exists, no secrets file. The install
- *                           predates per-install credentials and needs an
- *                           explicit migration; no password is returned.
+ *                           predates per-install credentials and must be
+ *                           migrated before it can start; no password is
+ *                           returned, and `migrationRequired` is true.
+ *
+ * This function is deliberately offline: it reads files and nothing else. The
+ * migration that a `legacy-unmigrated` result calls for lives in
+ * `credential-migration.js`, which needs a live datastore.
  *
  * @param {string} dataDir
- * @returns {{ user: string, password: string | null, legacy: boolean, source: string }}
+ * @returns {{ user: string, password: string | null, migrationRequired: boolean, source: string }}
  */
 function resolveDatabaseCredentials(dataDir) {
   const secretsFile = path.join(dataDir, SECRETS_FILENAME);
@@ -635,7 +645,7 @@ function resolveDatabaseCredentials(dataDir) {
     return {
       user: DATABASE_USER,
       password: null,
-      legacy: true,
+      migrationRequired: true,
       source: CREDENTIAL_SOURCE_LEGACY_UNMIGRATED,
     };
   }
@@ -643,7 +653,7 @@ function resolveDatabaseCredentials(dataDir) {
   return {
     user: DATABASE_USER,
     password,
-    legacy: false,
+    migrationRequired: false,
     source: hadSecrets ? CREDENTIAL_SOURCE_STORED : CREDENTIAL_SOURCE_GENERATED,
   };
 }
@@ -743,7 +753,6 @@ module.exports = {
   CredentialError,
   KEY_FILENAME,
   SECRETS_FILENAME,
-  LEGACY_DATABASE_PASSWORD,
   DATABASE_USER,
   DATABASE_DIRNAME,
   DATABASE_FILENAME,
@@ -754,8 +763,10 @@ module.exports = {
   CREDENTIAL_SOURCE_LEGACY_UNMIGRATED,
   CREDENTIAL_SOURCE_STORED,
   CREDENTIAL_SOURCE_GENERATED,
+  CREDENTIAL_SOURCE_MIGRATED,
   CREDENTIAL_ERROR_INVALID_SECRETS_FILE,
   CREDENTIAL_ERROR_INVALID_SECRET_VALUE,
   CREDENTIAL_ERROR_PERMISSIONS_TOO_OPEN,
   CREDENTIAL_ERROR_DATASTORE_UNREADABLE,
+  CREDENTIAL_ERROR_MIGRATION_REJECTED,
 };

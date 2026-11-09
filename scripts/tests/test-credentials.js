@@ -33,6 +33,7 @@ const COMPILED_SERVICE_TABLE = path.join(ROOT, 'dist', 'src', 'contracts', 'serv
 const COMPILED_CREDENTIALS = path.join(ROOT, 'dist', 'src', 'contracts', 'credentials.js');
 
 const credentials = require(path.join(ROOT, 'scripts', 'lib', 'credentials.js'));
+const migration = require(path.join(ROOT, 'scripts', 'lib', 'credential-migration.js'));
 
 let failures = 0;
 
@@ -42,12 +43,24 @@ let failures = 0;
  */
 function check(name, fn) {
   try {
-    fn();
+    const result = fn();
+    if (result && typeof result.then === 'function') {
+      return result.then(
+        () => {
+          console.log(`  -> ${name}`);
+        },
+        (error) => {
+          failures += 1;
+          console.error(`  !! ${name}: ${error.message}`);
+        }
+      );
+    }
     console.log(`  -> ${name}`);
   } catch (error) {
     failures += 1;
     console.error(`  !! ${name}: ${error.message}`);
   }
+  return Promise.resolve();
 }
 
 function fixture() {
@@ -123,7 +136,7 @@ function writeSecretsFile(dir, encodedPassword, rawContents) {
   return file;
 }
 
-function run() {
+async function run() {
   console.log('Testing Credential Store Contracts...');
 
   const cases = fixture();
@@ -135,8 +148,14 @@ function run() {
   check('obfuscation salt matches the fixture', () => {
     assert.equal(credentials.OBFUSCATION_SALT, cases.obfuscationSalt);
   });
-  check('legacy password is the documented fixed value', () => {
-    assert.equal(credentials.LEGACY_DATABASE_PASSWORD, 'root');
+  check('the legacy probe password is the documented fixed value', () => {
+    assert.equal(migration.LEGACY_PROBE_PASSWORD, 'root');
+  });
+  check('the legacy probe password is absent from the credential module', () => {
+    assert.equal('LEGACY_DATABASE_PASSWORD' in credentials, false);
+  });
+  check('the recovery file name is stable', () => {
+    assert.equal(migration.MIGRATION_PENDING_FILENAME, '.migration-pending');
   });
   check('database user is the documented fixed value', () => {
     assert.equal(credentials.DATABASE_USER, 'root');
@@ -201,8 +220,8 @@ function run() {
       check('the user is the fixed root account', () => {
         assert.equal(resolved.user, credentials.DATABASE_USER);
       });
-      check('the install is not flagged as legacy', () => {
-        assert.equal(resolved.legacy, false);
+      check('the install does not need migration', () => {
+        assert.equal(resolved.migrationRequired, false);
       });
       check('the password was generated, not stored', () => {
         assert.equal(resolved.source, 'generated');
@@ -210,8 +229,8 @@ function run() {
       check('the password is not empty', () => {
         assert.ok(resolved.password.length > 0);
       });
-      check('the password is not the legacy fixed value', () => {
-        assert.notEqual(resolved.password, credentials.LEGACY_DATABASE_PASSWORD);
+      check('the password is not the legacy probe value', () => {
+        assert.notEqual(resolved.password, migration.LEGACY_PROBE_PASSWORD);
       });
       check('the secrets file is obfuscated at rest', () => {
         const parsed = JSON.parse(
@@ -238,14 +257,14 @@ function run() {
       check('no password is returned', () => {
         assert.equal(resolved.password, null);
       });
-      check('the install is flagged as legacy', () => {
-        assert.equal(resolved.legacy, true);
+      check('the install is flagged as needing migration', () => {
+        assert.equal(resolved.migrationRequired, true);
       });
       check('the source is reported as legacy-unmigrated', () => {
         assert.equal(resolved.source, 'legacy-unmigrated');
       });
-      check('the legacy fixed password is never produced', () => {
-        assert.notEqual(resolved.password, credentials.LEGACY_DATABASE_PASSWORD);
+      check('the legacy probe password is never produced', () => {
+        assert.notEqual(resolved.password, migration.LEGACY_PROBE_PASSWORD);
       });
       check('no secrets file is written for a legacy install', () => {
         assert.equal(fs.existsSync(path.join(dir, credentials.SECRETS_FILENAME)), false);
@@ -447,7 +466,9 @@ function run() {
       assert.equal(facade.SECRETS_FILENAME, credentials.SECRETS_FILENAME);
       assert.equal(facade.OBFUSCATION_PREFIX, credentials.OBFUSCATION_PREFIX);
       assert.equal(facade.OBFUSCATION_SALT, credentials.OBFUSCATION_SALT);
-      assert.equal(facade.LEGACY_DATABASE_PASSWORD, credentials.LEGACY_DATABASE_PASSWORD);
+      assert.equal('LEGACY_DATABASE_PASSWORD' in facade, false);
+      assert.equal(facade.CREDENTIAL_SOURCE_MIGRATED, 'migrated');
+      assert.equal(facade.CREDENTIAL_ERROR_MIGRATION_REJECTED, 'migration-rejected');
       assert.equal(facade.DATABASE_USER, credentials.DATABASE_USER);
     });
     const dir = tempDir('facade');
@@ -457,7 +478,7 @@ function run() {
         const viaFacade = facade.resolveDatabaseCredentials(dir);
         assert.equal(viaFacade.password, canonical.password);
         assert.equal(viaFacade.user, canonical.user);
-        assert.equal(viaFacade.legacy, canonical.legacy);
+        assert.equal(viaFacade.migrationRequired, canonical.migrationRequired);
       });
       check('the facade reports that the secret is obfuscated at rest', () => {
         const store = facade.inspectDatabasePasswordStore(dir);
@@ -528,7 +549,7 @@ function run() {
           } else {
             assert.equal(thrown, null, `unexpected rejection: ${thrown && thrown.code}`);
             assert.equal(resolved.source, state.source);
-            assert.equal(resolved.legacy, state.legacy);
+            assert.equal(resolved.migrationRequired, state.outcome === 'legacy-unmigrated');
             assert.equal(resolved.password !== null, state.passwordAvailable);
             if (state.passwordAvailable) {
               assert.ok(resolved.password.length > 0);
@@ -590,13 +611,156 @@ function run() {
       assert.equal(credentials.CREDENTIAL_ERROR_DATASTORE_UNREADABLE, codes.datastoreUnreadable);
     });
     const sources = cases.sources || [];
-    for (const name of ['LEGACY_UNMIGRATED', 'STORED', 'GENERATED']) {
+    for (const name of ['LEGACY_UNMIGRATED', 'STORED', 'GENERATED', 'MIGRATED']) {
       check(`source constant ${name} is declared in the fixture`, () => {
         assert.ok(sources.includes(credentials[`CREDENTIAL_SOURCE_${name}`]));
       });
     }
+    check('migration rejected code', () => {
+      assert.equal(credentials.CREDENTIAL_ERROR_MIGRATION_REJECTED, codes.migrationRejected);
+    });
     check('the legacy unmigrated source is not spelled "legacy"', () => {
       assert.notEqual(credentials.CREDENTIAL_SOURCE_LEGACY_UNMIGRATED, 'legacy');
+    });
+  }
+  console.log('  -> Passed');
+
+  console.log('Test 16: Legacy datastores migrate without locking the install out');
+  {
+    const spec = cases.migration;
+    check('the fixture carries migration cases', () => {
+      assert.ok(spec && Array.isArray(spec.cases) && spec.cases.length > 0);
+    });
+    check('the recovery file name matches the fixture', () => {
+      assert.equal(migration.MIGRATION_PENDING_FILENAME, spec.pendingFilename);
+    });
+    check('the probe password matches the fixture', () => {
+      assert.equal(migration.LEGACY_PROBE_PASSWORD, spec.legacyProbePassword);
+    });
+
+    for (const testCase of spec.cases) {
+      await check(`migration case ${testCase.id}: ${testCase.description}`, async () => {
+        const dir = tempDir(`migration-${testCase.id}`);
+        try {
+          seedLegacyDatastore(dir);
+          const secretsFile = path.join(dir, credentials.SECRETS_FILENAME);
+          const pendingFile = path.join(dir, migration.MIGRATION_PENDING_FILENAME);
+
+          // Model the datastore as a single password it currently accepts, so a
+          // rotation is observable exactly the way it is against SurrealDB.
+          const datastore = {
+            current: migration.LEGACY_PROBE_PASSWORD,
+            unreachable: testCase.probeLegacy === 'unreachable',
+            rotations: [],
+          };
+
+          if (testCase.probeLegacy === 'rejected') {
+            // The datastore was already re-keyed by an operator.
+            datastore.current = 'operator-set-password';
+          }
+
+          if (testCase.pending === 'stale') {
+            // Provisioned by a run that crashed before the rotation committed.
+            credentials.writeSecretFile(pendingFile, credentials.encodeSecret('stale-pending'));
+          } else if (testCase.pending === 'committed') {
+            // Provisioned by a run that crashed after the rotation committed.
+            credentials.writeSecretFile(pendingFile, credentials.encodeSecret('committed-pending'));
+            datastore.current = 'committed-pending';
+          }
+
+          datastore.probe = (password) => {
+            if (datastore.unreachable) return migration.PROBE_UNREACHABLE;
+            return password === datastore.current
+              ? migration.PROBE_AUTHENTICATED
+              : migration.PROBE_REJECTED;
+          };
+          datastore.rotate = (currentPassword, newPassword) => {
+            datastore.rotations.push({ from: currentPassword, to: newPassword });
+            if (testCase.rotate === 'not-attempted') {
+              throw new Error('rotate must not be attempted in this case');
+            }
+            const accepted = currentPassword === datastore.current;
+            if (testCase.rotate === 'succeeds') {
+              if (!accepted) throw new Error('rotation rejected the supplied password');
+              datastore.current = newPassword;
+              return;
+            }
+            if (testCase.rotate === 'fails-committed') {
+              // The statement committed but the response was lost.
+              if (accepted) datastore.current = newPassword;
+              throw new Error('connection reset while awaiting the response');
+            }
+            if (testCase.rotate === 'fails-uncommitted') {
+              throw new Error('statement rejected');
+            }
+            return undefined;
+          };
+
+          let value = null;
+          let error = null;
+          try {
+            value = await migration.migrateLegacyDatastore(dir, datastore);
+          } catch (caught) {
+            error = caught;
+          }
+
+          const remaining = () => fs.existsSync(secretsFile);
+          {
+            if (testCase.errorCode !== null) {
+              assert.ok(error, 'expected the migration to fail');
+              assert.equal(error.code, testCase.errorCode);
+              assert.equal(value, null);
+            } else {
+              assert.equal(error, null, `unexpected failure: ${error && error.message}`);
+              assert.equal(value.source, testCase.source);
+              assert.equal(value.password !== null, testCase.passwordAvailable);
+              assert.notEqual(value.password, migration.LEGACY_PROBE_PASSWORD);
+            }
+
+            assert.equal(
+              remaining(),
+              testCase.writesSecretsFile,
+              'the secrets file must only exist when the case says it is written'
+            );
+            assert.equal(
+              fs.existsSync(pendingFile),
+              testCase.keepsPendingFile,
+              'the recovery file must only survive when the case says it is kept'
+            );
+            if (testCase.writesSecretsFile) {
+              // The persisted password must be the one the datastore now accepts,
+              // otherwise the next launch cannot authenticate.
+              const stored = credentials.decodeSecretChecked(
+                JSON.parse(fs.readFileSync(secretsFile, 'utf8')).surrealPassword
+              );
+              assert.equal(stored, datastore.current);
+              assert.equal(stored, value.password);
+            }
+            if (testCase.rotate === 'not-attempted') {
+              assert.equal(datastore.rotations.length, 0, 'no rotation should have been attempted');
+            } else if (!error && testCase.probeLegacy === 'authenticated') {
+              assert.equal(datastore.rotations.length, 1, 'exactly one rotation should be attempted');
+            }
+          }
+        } finally {
+          cleanup(dir);
+        }
+      });
+    }
+
+    await check('a resolved install is never migrated', () => {
+      const dir = tempDir('migration-noop');
+      try {
+        const first = credentials.resolveDatabaseCredentials(dir);
+        assert.equal(first.migrationRequired, false);
+        // No adapter: a non-legacy install must not touch the network at all.
+        return migration.prepareDatabaseCredentials(dir, null).then((again) => {
+          assert.equal(again.source, 'stored');
+          assert.equal(again.password, first.password);
+        });
+      } finally {
+        cleanup(dir);
+      }
     });
   }
   console.log('  -> Passed');

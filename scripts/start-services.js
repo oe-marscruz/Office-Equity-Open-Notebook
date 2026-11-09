@@ -16,9 +16,16 @@ const { spawnServiceProcess } = require('./service-diagnostics');
 const {
   buildCredentialEnvironment,
   resolveDatabaseCredentials,
+  isUsableSecretValue,
   CredentialError,
   CREDENTIAL_ERROR_INVALID_SECRETS_FILE,
+  SECRETS_FILENAME,
 } = require('./lib/credentials');
+const {
+  createSurrealHttpDatastore,
+  prepareDatabaseCredentials,
+  LEGACY_PROBE_PASSWORD,
+} = require('./lib/credential-migration');
 const net = require('net');
 const http = require('http');
 const path = require('path');
@@ -29,6 +36,9 @@ const PORTS = {
   api: 5055,
   frontend: 8502,
 };
+
+const SURREAL_NAMESPACE = 'open_notebook';
+const SURREAL_DATABASE = 'open_notebook';
 
 /**
  * Resolve a bundled executable, falling back to a command on PATH.
@@ -165,6 +175,64 @@ async function waitForServiceReady(port, url, timeoutMs = 60000, label = String(
 }
 
 /**
+ * Adapts the SurrealDB that `startServices` spawns to the migration interface.
+ *
+ * The port is the one the launcher actually binds, not a hardcoded default, so
+ * the migration always talks to the datastore this process started.
+ */
+function surrealDatastore(port = PORTS.surreal) {
+  return createSurrealHttpDatastore({
+    port,
+    namespace: SURREAL_NAMESPACE,
+    database: SURREAL_DATABASE,
+  });
+}
+
+/**
+ * Decides which credential the launch uses, and fails closed when it cannot be
+ * determined.
+ *
+ * A datastore that exists with no readable secrets file is ambiguous: either the
+ * install predates per-install passwords (recoverable by migration) or someone
+ * deleted the file after a successful migration (not recoverable, because the
+ * only password that works has been rotated away). The former is recoverable, so
+ * it must not be reported as an error; the latter must never be papered over by
+ * falling back to a default, which is how the historical `root` default locked
+ * installs out of their own data.
+ *
+ * @param {{ credentials?: object }} cfg
+ * @param {string} dataDir
+ * @returns {{ credentials: object, needsMigration: boolean, credentialEnv: object }}
+ */
+function resolveStartupCredentials(cfg, dataDir) {
+  const credentials = cfg.credentials || resolveDatabaseCredentials(dataDir);
+  if (cfg.credentials) {
+    return { credentials, needsMigration: false, credentialEnv: buildCredentialEnvironment(credentials) };
+  }
+  const needsMigration = credentials.migrationRequired === true;
+  if (!needsMigration && !isUsableSecretValue(credentials.password)) {
+    throw new CredentialError(
+      'The database credential file is missing or unreadable but the datastore already exists. ' +
+        'Restore secrets.json from a backup, or restore the datastore from the backup made alongside it. ' +
+        'Open Notebook cannot start because the existing datastore will not accept a new password.',
+      CREDENTIAL_ERROR_INVALID_SECRETS_FILE,
+      path.join(dataDir, SECRETS_FILENAME)
+    );
+  }
+  if (needsMigration) {
+    // While the migration is pending the other services cannot be given an
+    // environment: the only password that exists belongs to the datastore and is
+    // about to be replaced. SurrealDB starts first and rotation happens below.
+    return {
+      credentials,
+      needsMigration,
+      credentialEnv: buildCredentialEnvironment({ user: credentials.user, password: LEGACY_PROBE_PASSWORD }),
+    };
+  }
+  return { credentials, needsMigration, credentialEnv: buildCredentialEnvironment(credentials) };
+}
+
+/**
  * Start all services.
  * @param {object} cfg
  * @param {string} cfg.runtimePath  Path to the assembled runtime folder.
@@ -227,18 +295,21 @@ async function startServices(cfg) {
   // They travel through the process environment rather than the command line
   // so they never appear in a process listing.
   //
-  // A legacy-unmigrated install has no password at all; that is reported to
-  // the caller instead of being papered over with the old fixed password.
-  const credentials = cfg.credentials || resolveDatabaseCredentials(dataDir);
-  if (credentials.source === 'legacy-unmigrated' || !credentials.password) {
-    throw new CredentialError(
-      'Existing datastore has no credential file; recovery is required',
-      CREDENTIAL_ERROR_INVALID_SECRETS_FILE
-    );
-  }
-  const credentialEnv = buildCredentialEnvironment(credentials);
+  // A legacy-unmigrated install has no password file, but it does have a
+  // datastore that still trusts the historical credential. That datastore is
+  // started with that credential so the migration can reach it, and the
+  // password is then rotated to a provisioned one before any other service
+  // starts. Migrating before the swap would be impossible: the only credential
+  // that can authenticate is the one being replaced.
+  //
+  // `cfg.credentials` is honoured only for tests, which supply their own.
+  const startup = resolveStartupCredentials(cfg, dataDir);
+  let credentials = startup.credentials;
+  const needsMigration = startup.needsMigration;
+  const credentialEnv = startup.credentialEnv;
+  const surrealDbFile = path.join(dataDir, 'surrealdb', 'mydatabase.db');
 
-  const backendEnv = {
+  let backendEnv = {
     ...process.env,
     PYTHONPATH: backendPath,
     PYTHONUNBUFFERED: '1',
@@ -246,8 +317,8 @@ async function startServices(cfg) {
     DATA_FOLDER: dataFolder,
     SURREAL_URL: 'ws://127.0.0.1:8000/rpc',
     ...credentialEnv,
-    SURREAL_NAMESPACE: 'open_notebook',
-    SURREAL_DATABASE: 'open_notebook',
+    SURREAL_NAMESPACE,
+    SURREAL_DATABASE,
     OPEN_NOTEBOOK_ENCRYPTION_KEY: encryptionKey,
     // Docling is pre-installed into the bundled runtime by prepare-runtime.js,
     // so it is always enabled in the desktop app.
@@ -268,8 +339,29 @@ async function startServices(cfg) {
     return child;
   }
 
+  async function stopChildren() {
+    // Kill in reverse order (frontend, worker, api, surreal)
+    for (const child of [...children].reverse()) {
+      try {
+        if (!child.killed) child.kill();
+      } catch (_) {
+        /* ignore */
+      }
+    }
+    // Give them a moment, then force-kill anything left.
+    await sleep(1500);
+    for (const child of children) {
+      try {
+        if (child.exitCode === null && !child.killed) {
+          child.kill('SIGKILL');
+        }
+      } catch (_) {
+        /* ignore */
+      }
+    }
+  }
+
   // 1. SurrealDB
-  const surrealDbFile = path.join(dataDir, 'surrealdb', 'mydatabase.db');
   spawnService(
     'surrealdb',
     surrealExe,
@@ -277,6 +369,23 @@ async function startServices(cfg) {
     { cwd: dataDir, env: backendEnv }
   );
   await waitForServiceReady(PORTS.surreal, `http://127.0.0.1:${PORTS.surreal}/health`, 60000, 'SurrealDB');
+
+  // 1b. Rotate a legacy datastore to a provisioned password. This runs after
+  // SurrealDB is listening and before any other service starts, so no service
+  // is ever handed a password the datastore has already replaced.
+  if (needsMigration) {
+    try {
+      const migrated = await prepareDatabaseCredentials(dataDir, surrealDatastore());
+      credentials = migrated;
+      backendEnv = { ...backendEnv, ...buildCredentialEnvironment(migrated) };
+    } catch (error) {
+      // A failed migration must not leave the datastore we just spawned running:
+      // the next launch would report a port conflict against the orphan and the
+      // real cause would be hidden.
+      await stopChildren();
+      throw error;
+    }
+  }
 
   // 2. FastAPI backend
   spawnService(
@@ -304,28 +413,8 @@ async function startServices(cfg) {
   return {
     children,
     ports: { ...PORTS },
-    async stop() {
-      // Kill in reverse order (frontend, worker, api, surreal)
-      for (const child of [...children].reverse()) {
-        try {
-          if (!child.killed) child.kill();
-        } catch (_) {
-          /* ignore */
-        }
-      }
-      // Give them a moment, then force-kill anything left.
-      await sleep(1500);
-      for (const child of children) {
-        try {
-          if (child.exitCode === null && !child.killed) {
-            child.kill('SIGKILL');
-          }
-        } catch (_) {
-          /* ignore */
-        }
-      }
-    },
+    stop: stopChildren,
   };
 }
 
-module.exports = { startServices, PORTS, isPortOpen, waitForPort, waitForServiceReady, isHttpReady };
+module.exports = { startServices, resolveStartupCredentials, PORTS, isPortOpen, waitForPort, waitForServiceReady, isHttpReady };
