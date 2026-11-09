@@ -78,7 +78,9 @@ pub async fn start_services(runtime_path: PathBuf) -> Result<(), String> {
     // encryption key. The credentials travel through the child environment
     // rather than the command line so they never appear in a process listing.
     let credentials = credentials::resolve_database_credentials(&data_dir)?;
-    let credential_env = credentials::build_credential_environment(&credentials);
+    // A `LegacyUnmigrated` install has no password yet, so this refuses to
+    // build an environment rather than starting SurrealDB with a default.
+    let credential_env = credentials::build_credential_environment(&credentials)?;
     let encryption_key = credentials::ensure_encryption_key(&data_dir)?;
 
     let logs_dir = data_dir.join("logs");

@@ -22,6 +22,7 @@ console.log('--- Suite 1: Feature Flag Configuration ---');
     backendPath: '/test/backend',
     dataFolder: '/test/data',
     encryptionKey: 'test-key',
+    credentials: { user: 'root', password: 'synthetic-contract-password' },
     tiktokenCache: '/test/cache',
     enableDocling: true,
   });
@@ -32,6 +33,7 @@ console.log('--- Suite 1: Feature Flag Configuration ---');
     backendPath: '/test/backend',
     dataFolder: '/test/data',
     encryptionKey: 'test-key',
+    credentials: { user: 'root', password: 'synthetic-contract-password' },
     tiktokenCache: '/test/cache',
     enableDocling: false,
   });
@@ -42,6 +44,7 @@ console.log('--- Suite 1: Feature Flag Configuration ---');
     backendPath: '/test/backend',
     dataFolder: '/test/data',
     encryptionKey: 'test-key',
+    credentials: { user: 'root', password: 'synthetic-contract-password' },
     tiktokenCache: '/test/cache',
     enableDocling: 'false',
   });
@@ -74,6 +77,7 @@ console.log('\n--- Suite 2: Core Workflows Operational Without Docling ---');
     backendPath: '/test/backend',
     dataFolder: '/test/data',
     encryptionKey: 'test-key',
+    credentials: { user: 'root', password: 'synthetic-contract-password' },
     tiktokenCache: '/test/cache',
     enableDocling: false,
   });

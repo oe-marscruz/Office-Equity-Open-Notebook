@@ -24,7 +24,7 @@
     "bundle": {
       "active": true,
       "identifier": "com.officeequity.opennotebook",
-      "icon": ["../open-notebook/frontend/src/app/favicon.ico"],
+      "icon": ["icons/icon.ico"],
       "targets": ["msi", "appimage", "dmg"]
     },
     "security": {

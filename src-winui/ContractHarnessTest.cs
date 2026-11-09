@@ -84,12 +84,14 @@ namespace OfficeEquityOpenNotebook
                             string targetUrl = input.GetProperty("targetUrl").GetString() ?? "";
                             var expectedAction = pc.GetProperty("expectedOutput").GetProperty("action").GetString();
 
-                            if (expectedAction == "allow")
-                                casePassed = navPolicy.IsAllowedOrigin(targetUrl);
-                            else if (expectedAction == "deny")
-                                casePassed = targetUrl.StartsWith("file://");
-                            else if (expectedAction == "external")
-                                casePassed = !navPolicy.IsAllowedOrigin(targetUrl) && !targetUrl.StartsWith("file://");
+                            // Compare against the policy's own three-valued
+                            // classification rather than re-deriving it here, so
+                            // a drift in the policy shows up as a failed case
+                            // instead of being masked by the assertion.
+                            if (expectedAction != null)
+                                casePassed = navPolicy.NavigationAction(targetUrl) == expectedAction;
+                            else if (pc.TryGetProperty("expectedValid", out var valid))
+                                casePassed = navPolicy.IsAllowedOrigin(targetUrl) == valid.GetBoolean();
                             break;
 
                         case "process-manager-log":

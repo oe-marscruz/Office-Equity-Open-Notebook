@@ -11,8 +11,16 @@ release/
 out/
 src-tauri/target/
 
+# `//go:embed all:frontend/dist` in src-wails/main.go needs the directory to exist in a
+# fresh checkout, and Go cannot embed an empty directory. The marker is the only file kept.
+!src-wails/frontend/dist/
+!src-wails/frontend/dist/.gitkeep
+
 # Test data
 resources/.testdata/
+
+# Compatibility-harness output (written by src-wails/contract_harness_test.go on every run)
+src-wails/compatibility-result-go.json
 
 # Logs
 *.log

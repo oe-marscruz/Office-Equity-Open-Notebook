@@ -91,7 +91,7 @@ async function electronErrors(mode) {
         if(mode==='key-error')throw Error('SYNTHETIC_EXCEPTION');
         return 'synthetic key';
       },
-      resolveDatabaseCredentials:()=>({user:'root',password:'synthetic',legacy:true,source:'legacy'}),
+      resolveDatabaseCredentials:()=>({user:'root',password:'synthetic',legacy:false,source:'stored'}),
     }};
   vm.runInNewContext(fs.readFileSync(path.join(root,'main.js'),'utf8'),{
     require:name=>{assert.ok(Object.hasOwn(dependencies,name));return dependencies[name];},

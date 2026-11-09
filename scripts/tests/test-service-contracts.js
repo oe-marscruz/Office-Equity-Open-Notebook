@@ -61,6 +61,7 @@ function run() {
     backendPath: '/test/backend',
     dataFolder: '/test/data',
     encryptionKey: 'test-key-123',
+    credentials: { user: 'root', password: 'synthetic-contract-password' },
     tiktokenCache: '/test/cache',
     apiPort: 5055,
   });

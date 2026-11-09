@@ -205,20 +205,44 @@ export interface BackendEnvironment extends Record<string, string | undefined> {
 /**
  * Where a resolved database password came from.
  *
- * - `legacy`: the install predates per-install credentials, so the fixed
- *   `root` password is retained to keep the existing datastore reachable.
+ * - `legacy-unmigrated`: a datastore exists but `secrets.json` does not, so
+ *   the install predates per-install credentials. No password is returned:
+ *   the host has to run the migration instead of quietly connecting as `root`.
  * - `stored`: the password was read back from `secrets.json`.
  * - `generated`: a new random password was created for this install.
+ * - `migrated`: this process is the one that just rotated a legacy install
+ *   onto a provisioned password. Provenance, not state: the next launch reads
+ *   the same password back and reports `stored`.
  */
-export type DatabaseCredentialSource = 'legacy' | 'stored' | 'generated';
+export type DatabaseCredentialSource =
+  | 'legacy-unmigrated'
+  | 'stored'
+  | 'generated'
+  | 'migrated';
+
+/**
+ * Stable failure codes for the credential store.
+ *
+ * Launchers render host-appropriate guidance from these instead of matching on
+ * message text, and every host's test suite asserts the same values.
+ */
+export type DatabaseCredentialErrorCode =
+  | 'invalid-secrets-file'
+  | 'invalid-secret-value'
+  | 'permissions-too-open'
+  | 'datastore-unreadable'
+  | 'migration-rejected';
 
 export interface DatabaseCredentials {
   /** The SurrealDB root user name. Fixed, because it is not a secret. */
   user: string;
-  /** The SurrealDB root password. */
-  password: string;
-  /** True when the fixed legacy password is in use. */
-  legacy: boolean;
+  /**
+   * The SurrealDB root password, or null when the install has not been
+   * migrated yet. Callers must handle the null case explicitly.
+   */
+  password: string | null;
+  /** True when the install still needs credential migration. */
+  migrationRequired: boolean;
   /** Provenance of the resolved password. */
   source: DatabaseCredentialSource;
 }
@@ -258,7 +282,7 @@ export interface CredentialStoreResult {
   persisted: boolean;
   /** True when the stored bytes do not contain the secret in plaintext. */
   obfuscatedAtRest: boolean;
-  /** True when the file ACL was successfully restricted to the current user. */
+  /** True when the file is provably readable only by the current user. */
   aclRestricted: boolean;
 }
 

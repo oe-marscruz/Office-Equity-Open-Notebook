@@ -49,6 +49,71 @@ function showErrorAndExit(title, message) {
   app.exit(1);
 }
 
+/**
+ * Builds operator-facing guidance for a credential failure.
+ *
+ * Each state has a distinct remedy, and the generic "review the service
+ * lifecycle diagnostics" message would send users to logs that cannot contain
+ * the fix. The messages are deliberately free of secret material.
+ */
+function describeCredentialFailure(err) {
+  const code = err && err.code ? err.code : 'unknown';
+  switch (code) {
+    case 'invalid-secrets-file':
+      return (
+        'The saved database credentials for this installation could not be read. ' +
+        'They have been left untouched so the existing notebook data is not put out of reach. ' +
+        'Restore the credentials file from a backup, or contact your administrator to run credential recovery.'
+      );
+    case 'invalid-secret-value':
+      return (
+        'The saved database credential for this installation is not a valid value. ' +
+        'It has been left untouched so the existing notebook data is not put out of reach. ' +
+        'Contact your administrator to run credential recovery.'
+      );
+    case 'permissions-too-open':
+      return (
+        'The saved database credentials are readable by other users on this computer. ' +
+        'The file has been left untouched. Restrict its permissions to your own account, or contact your administrator.'
+      );
+    case 'datastore-unreadable':
+      return (
+        'The notebook database could not be inspected. Check that no other process is using it, then try again.'
+      );
+    default:
+      return 'SERVICE_STARTUP_FAILED: Review the service lifecycle diagnostics.';
+  }
+}
+
+/**
+ * Resolves the credentials the app needs to start, or reports and exits.
+ *
+ * The legacy-unmigrated state is called out separately: such an install has a
+ * database but no per-install credential, so it must not fall back to the old
+ * fixed password.
+ */
+function resolveCredentialsOrExit(dataDir) {
+  try {
+    const credentials = resolveDatabaseCredentials(dataDir);
+    if (credentials.source === 'legacy-unmigrated' || !credentials.password) {
+      showErrorAndExit(
+        'Office of Equity Open Notebook — database credentials need migration',
+        'This installation was created by an older version and does not have a saved database credential yet. ' +
+          'It has been left unchanged so no notebook data is lost. ' +
+          'Contact your administrator to run credential recovery before starting the app again.'
+      );
+      return null;
+    }
+    return credentials;
+  } catch (err) {
+    showErrorAndExit(
+      'Office of Equity Open Notebook — database credentials unavailable',
+      describeCredentialFailure(err)
+    );
+    return null;
+  }
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1440,
@@ -92,8 +157,6 @@ function createWindow() {
 app.whenReady().then(async () => {
   const runtimePath = resolveRuntimePath();
   const dataDir = app.getPath('userData');
-  const encryptionKey = ensureEncryptionKey(dataDir);
-  const credentials = resolveDatabaseCredentials(dataDir);
 
   const required = [
     path.join(runtimePath, 'surreal', 'surreal.exe'),
@@ -105,6 +168,20 @@ app.whenReady().then(async () => {
     showErrorAndExit(
       'Office of Equity Open Notebook — runtime not found',
       'The bundled runtime is incomplete. Please re-run `npm run prepare:runtime` and rebuild the app.'
+    );
+    return;
+  }
+
+  const credentials = resolveCredentialsOrExit(dataDir);
+  if (!credentials) return;
+
+  let encryptionKey;
+  try {
+    encryptionKey = ensureEncryptionKey(dataDir);
+  } catch (err) {
+    showErrorAndExit(
+      'Office of Equity Open Notebook — encryption key unavailable',
+      describeCredentialFailure(err)
     );
     return;
   }

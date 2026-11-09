@@ -19,22 +19,47 @@
 
 import path from 'path';
 import credentialsModule from '../../scripts/lib/credentials';
+import migrationModule from '../../scripts/lib/credential-migration';
 import {
   CredentialEnvironment,
   CredentialStoreLayout,
   CredentialStoreResult,
+  DatabaseCredentialErrorCode,
+  DatabaseCredentialSource,
   DatabaseCredentials,
 } from '../types';
+
+/** The probe password a legacy datastore is offered once, before migration. */
+export const LEGACY_PROBE_PASSWORD: string = migrationModule.LEGACY_PROBE_PASSWORD;
 
 /** File names of the on-disk secret store. */
 export const KEY_FILENAME: string = credentialsModule.KEY_FILENAME;
 export const SECRETS_FILENAME: string = credentialsModule.SECRETS_FILENAME;
 
-/** The fixed password used by installs that predate per-install credentials. */
-export const LEGACY_DATABASE_PASSWORD: string = credentialsModule.LEGACY_DATABASE_PASSWORD;
-
 /** The SurrealDB root user name. Fixed, because it is not itself a secret. */
 export const DATABASE_USER: string = credentialsModule.DATABASE_USER;
+
+/** The credential-state identifiers shared by every host. */
+export const CREDENTIAL_SOURCE_LEGACY_UNMIGRATED: DatabaseCredentialSource =
+  credentialsModule.CREDENTIAL_SOURCE_LEGACY_UNMIGRATED as DatabaseCredentialSource;
+export const CREDENTIAL_SOURCE_STORED: DatabaseCredentialSource =
+  credentialsModule.CREDENTIAL_SOURCE_STORED as DatabaseCredentialSource;
+export const CREDENTIAL_SOURCE_GENERATED: DatabaseCredentialSource =
+  credentialsModule.CREDENTIAL_SOURCE_GENERATED as DatabaseCredentialSource;
+export const CREDENTIAL_SOURCE_MIGRATED: DatabaseCredentialSource =
+  credentialsModule.CREDENTIAL_SOURCE_MIGRATED as DatabaseCredentialSource;
+
+/** The failure codes shared by every host. */
+export const CREDENTIAL_ERROR_INVALID_SECRETS_FILE: DatabaseCredentialErrorCode =
+  credentialsModule.CREDENTIAL_ERROR_INVALID_SECRETS_FILE as DatabaseCredentialErrorCode;
+export const CREDENTIAL_ERROR_INVALID_SECRET_VALUE: DatabaseCredentialErrorCode =
+  credentialsModule.CREDENTIAL_ERROR_INVALID_SECRET_VALUE as DatabaseCredentialErrorCode;
+export const CREDENTIAL_ERROR_PERMISSIONS_TOO_OPEN: DatabaseCredentialErrorCode =
+  credentialsModule.CREDENTIAL_ERROR_PERMISSIONS_TOO_OPEN as DatabaseCredentialErrorCode;
+export const CREDENTIAL_ERROR_DATASTORE_UNREADABLE: DatabaseCredentialErrorCode =
+  credentialsModule.CREDENTIAL_ERROR_DATASTORE_UNREADABLE as DatabaseCredentialErrorCode;
+export const CREDENTIAL_ERROR_MIGRATION_REJECTED: DatabaseCredentialErrorCode =
+  credentialsModule.CREDENTIAL_ERROR_MIGRATION_REJECTED as DatabaseCredentialErrorCode;
 
 /** Marker prefix identifying an obfuscated value in a secret file. */
 export const OBFUSCATION_PREFIX: string = credentialsModule.OBFUSCATION_PREFIX;
@@ -56,13 +81,18 @@ export function describeCredentialStore(dataDir: string): CredentialStoreLayout 
 /**
  * Resolves the SurrealDB credentials to start the database with.
  *
- * An install whose datastore predates per-install credentials keeps the
- * original `root` password, because SurrealDB applies initial root
- * credentials only when no root user exists yet. Only fresh installs receive
- * a randomly generated password.
+ * SurrealDB applies initial root credentials only when no root user exists
+ * yet, so a freshly generated password has no effect on a datastore created by
+ * an older build. An install in that position is reported as
+ * `legacy-unmigrated` with a null password; the caller must run the migration
+ * instead of connecting as `root`. Only fresh installs receive a randomly
+ * generated password.
+ *
+ * @throws {Error} Carrying one of the `DatabaseCredentialErrorCode` values.
  */
 export function resolveDatabaseCredentials(dataDir: string): DatabaseCredentials {
-  return credentialsModule.resolveDatabaseCredentials(dataDir) as DatabaseCredentials;
+  const resolved = credentialsModule.resolveDatabaseCredentials(dataDir);
+  return resolved as unknown as DatabaseCredentials;
 }
 
 /**
@@ -85,19 +115,33 @@ export function ensureDatabasePassword(dataDir: string): string {
 
 /**
  * True when `dataDir` already holds a SurrealDB datastore from an earlier run.
+ *
+ * @throws {Error} `datastore-unreadable` when the datastore cannot be
+ * inspected — guessing "no datastore" would overwrite a live install's
+ * password.
  */
 export function hasExistingDatastore(dataDir: string): boolean {
   return credentialsModule.hasExistingDatastore(dataDir) as boolean;
 }
 
 /**
- * Restricts a file to the current OS user.
+ * Restricts a file to the current OS user and returns whether that worked.
  *
- * Best effort by design: a failure here must never stop the app from
- * starting.
+ * Enforced, not best effort: callers that write a secret treat `false` as a
+ * failure rather than continuing with a world-readable file.
  */
 export function restrictToCurrentUser(file: string): boolean {
   return credentialsModule.restrictToCurrentUser(file) as boolean;
+}
+
+/**
+ * Reports whether `file` is currently restricted to the current OS user.
+ *
+ * The check is a post-condition, so it also catches a restriction that
+ * silently failed or was widened afterwards.
+ */
+export function checkRestrictedToCurrentUser(file: string): boolean {
+  return credentialsModule.checkRestrictedToCurrentUser(file) as boolean;
 }
 
 /**
@@ -106,10 +150,12 @@ export function restrictToCurrentUser(file: string): boolean {
  *
  * The credentials travel through the process environment rather than the
  * command line, so they never appear in a process listing.
+ *
+ * @throws {Error} `invalid-secret-value` when no password is available.
  */
 export function buildCredentialEnvironment(credentials: {
   user: string;
-  password: string;
+  password: string | null;
 }): CredentialEnvironment {
   return credentialsModule.buildCredentialEnvironment(credentials) as CredentialEnvironment;
 }
@@ -150,7 +196,7 @@ export function inspectEncryptionKeyStore(dataDir: string): CredentialStoreResul
     value,
     persisted: existedBefore,
     obfuscatedAtRest: isObfuscatedAtRest(layout.encryptionKeyFile),
-    aclRestricted: true,
+    aclRestricted: checkRestrictedToCurrentUser(layout.encryptionKeyFile),
   };
 }
 
@@ -165,7 +211,7 @@ export function inspectDatabasePasswordStore(dataDir: string): CredentialStoreRe
     value,
     persisted: existedBefore,
     obfuscatedAtRest: isPasswordObfuscatedAtRest(layout.secretsFile),
-    aclRestricted: true,
+    aclRestricted: checkRestrictedToCurrentUser(layout.secretsFile),
   };
 }
 

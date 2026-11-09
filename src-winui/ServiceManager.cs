@@ -129,7 +129,20 @@ namespace OfficeEquityOpenNotebook
             // Resolve the per-install database credentials and the provider-API-key
             // encryption key. The credentials travel through the child environment
             // rather than the command line so they never appear in a process listing.
+            //
+            // ResolveDatabaseCredentials throws rather than falling back to the
+            // legacy root password: a datastore without a secrets file needs an
+            // explicit migration, and a damaged file may still hold the only copy
+            // of the password the datastore accepts. Starting anyway would either
+            // silently use a publicly known password or overwrite that copy.
             DatabaseCredentials credentials = Credentials.ResolveDatabaseCredentials(DataDir);
+            if (credentials.Source == CredentialSource.LegacyUnmigrated)
+            {
+                throw new CredentialException(
+                    "Credential migration is required for this installation",
+                    CredentialErrorCodes.InvalidSecretsFile,
+                    DataDir);
+            }
             CredentialEnvironment credentialEnv = Credentials.BuildCredentialEnvironment(credentials);
             string encryptionKey = Credentials.EnsureEncryptionKey(DataDir);
 
