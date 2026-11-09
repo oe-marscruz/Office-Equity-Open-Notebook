@@ -81,7 +81,19 @@ func TestCompatibilityScenarios(t *testing.T) {
 			}
 			_ = json.Unmarshal(pc.Input, &input)
 			allowed := navPolicy.IsAllowedOrigin(input.TargetURL)
-			casePassed = (allowed == pc.ExpectedValid)
+			var expectedAction string
+			if len(pc.ExpectedOutput) > 0 {
+				var output struct {
+					Action string `json:"action"`
+				}
+				_ = json.Unmarshal(pc.ExpectedOutput, &output)
+				expectedAction = output.Action
+			}
+			if expectedAction != "" {
+				casePassed = (navPolicy.NavigationAction(input.TargetURL) == expectedAction)
+			} else {
+				casePassed = (allowed == pc.ExpectedValid)
+			}
 
 		case "process-manager-shutdown":
 			var services []string

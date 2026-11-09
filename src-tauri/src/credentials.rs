@@ -23,7 +23,10 @@
 //! # Legacy installs
 //!
 //! Existing datastores with missing credentials require explicit recovery.
-//! Startup never assumes a legacy password or replaces a damaged secret.
+//! Startup never assumes a legacy password or replaces a damaged secret: a
+//! datastore without a `secrets.json` is reported as
+//! [`CredentialSource::LegacyUnmigrated`] with no password, so the caller has
+//! to run the migration instead of quietly connecting as `root`.
 //!
 //! Obfuscation does not authenticate stored values, so some corruption cannot
 //! be detected without changing the shared on-disk format.
@@ -77,8 +80,9 @@ pub const DATABASE_PASSWORD_BYTES: usize = 24;
 /// Where the resolved database password came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialSource {
-    /// The install predates per-install credentials and keeps `root`/`root`.
-    Legacy,
+    /// A datastore exists but `secrets.json` does not: the install predates
+    /// per-install credentials and needs an explicit migration.
+    LegacyUnmigrated,
     /// The password was read back from an existing secret store.
     Stored,
     /// The password was generated on this run.
@@ -90,9 +94,9 @@ pub enum CredentialSource {
 pub struct DatabaseCredentials {
     /// The SurrealDB user name.
     pub user: String,
-    /// The SurrealDB password.
-    pub password: String,
-    /// True when the install still uses the legacy `root`/`root` credential.
+    /// The SurrealDB password, absent until the install has been migrated.
+    pub password: Option<String>,
+    /// True when the install still needs credential migration.
     pub legacy: bool,
     /// Where the password came from.
     pub source: CredentialSource,
@@ -267,25 +271,86 @@ pub fn restrict_to_current_user(file: &Path) -> bool {
             Ok(value) if !value.trim().is_empty() => value,
             _ => return false,
         };
-        std::process::Command::new("icacls")
+        let status = std::process::Command::new("icacls")
             .arg(file).arg("/inheritance:r").arg("/grant:r")
             .arg(format!("{}:F", user))
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status().map(|status| status.success()).unwrap_or(false)
+            .status().map(|status| status.success()).unwrap_or(false);
+        status && check_restricted_to_current_user(file)
     }
     #[cfg(not(windows))]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(file, fs::Permissions::from_mode(0o600)).is_ok()
+            && check_restricted_to_current_user(file)
     }
+}
+
+/// Returns whether `file` is provably readable only by the current OS user.
+///
+/// The restriction is verified rather than assumed: `icacls` can report success
+/// while a second ACE (an explicit grant, or an inherited one the command did
+/// not remove) still exposes the secret, and a POSIX mode can be widened again
+/// after the fact.
+pub fn check_restricted_to_current_user(file: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let output = match std::process::Command::new("icacls").arg(file).output() {
+            Ok(output) if output.status.success() => output,
+            _ => return false,
+        };
+        let listing = String::from_utf8_lossy(&output.stdout);
+        is_restricted_acl_listing(&listing)
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match fs::metadata(file) {
+            Ok(metadata) => is_restricted_posix_mode(metadata.permissions().mode() & 0o777),
+            Err(_) => false,
+        }
+    }
+}
+
+/// Classifies `icacls` output as owner-only or not.
+///
+/// `icacls` interleaves diagnostics (`Successfully processed …`, an unresolved
+/// domain trust, a mandatory-integrity label) with the ACL itself, so the ACE
+/// lines are isolated before counting. Exactly one non-inherited full-control
+/// ACE for a single principal is the only accepted shape.
+pub fn is_restricted_acl_listing(listing: &str) -> bool {
+    let aces: Vec<&str> = listing
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| {
+            !line.starts_with("Successfully processed")
+                && !line.starts_with("Failed processing")
+                && !line.starts_with("The trust relationship")
+                && !line.starts_with("Mandatory Label")
+        })
+        .collect();
+    if aces.len() != 1 {
+        return false;
+    }
+    let ace = aces[0];
+    !ace.contains("(I)") && ace.ends_with("(F)")
+}
+
+/// True when a POSIX mode grants nothing to group or other.
+pub fn is_restricted_posix_mode(mode: u32) -> bool {
+    mode & 0o077 == 0
 }
 
 fn protected_read(file: &Path) -> Result<Option<String>, String> {
     match fs::read_to_string(file) {
         Ok(contents) => {
-            if !restrict_to_current_user(file) {
-                return Err("Could not restrict credential file permissions".into());
+            // Verified, not repaired. A file that other accounts can read may
+            // already have exposed the secret, and silently tightening the ACL
+            // would hide that from the user.
+            if !check_restricted_to_current_user(file) {
+                return Err("Credential file permissions are too open".into());
             }
             Ok(Some(contents))
         }
@@ -330,8 +395,15 @@ fn decode_checked(stored: &str) -> Result<String, String> {
 }
 
 /// Returns whether a datastore exists, failing closed on inspection errors.
+///
+/// Both the datastore file and its directory have to be inspected: a directory
+/// that exists but cannot be listed hides a legacy datastore just as
+/// effectively as an unreadable file does, and reporting "fresh install" for an
+/// unreadable datastore would overwrite the credentials of an install that
+/// still works.
 pub fn has_existing_datastore(data_dir: &Path) -> Result<bool, String> {
-    let file = data_dir.join(DATABASE_DIRNAME).join(DATABASE_FILENAME);
+    let dir = data_dir.join(DATABASE_DIRNAME);
+    let file = dir.join(DATABASE_FILENAME);
     match fs::metadata(&file) {
         Ok(metadata) if metadata.is_dir() => {
             let mut entries = fs::read_dir(&file).map_err(|_| "Could not inspect datastore")?;
@@ -342,7 +414,11 @@ pub fn has_existing_datastore(data_dir: &Path) -> Result<bool, String> {
             }
         }
         Ok(metadata) => Ok(metadata.len() > 0),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match fs::read_dir(&dir) {
+            Ok(_) => Ok(false),
+            Err(dir_error) if dir_error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(_) => Err("Could not inspect datastore".into()),
+        },
         Err(_) => Err("Could not inspect datastore".into()),
     }
 }
@@ -380,9 +456,21 @@ pub fn resolve_database_credentials(data_dir: &Path) -> Result<DatabaseCredentia
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(_) => return Err("Could not inspect database credential file".into()),
     };
+    if !existed && has_existing_datastore(data_dir)? {
+        // The datastore predates per-install credentials. Report the state
+        // instead of inventing a password: SurrealDB ignores initial
+        // credentials for a datastore that already has a root user, so any
+        // password generated here would lock the backend out.
+        return Ok(DatabaseCredentials {
+            user: DATABASE_USER.to_string(),
+            password: None,
+            legacy: true,
+            source: CredentialSource::LegacyUnmigrated,
+        });
+    }
     let password = ensure_database_password(data_dir)?;
     Ok(DatabaseCredentials {
-        user: DATABASE_USER.to_string(), password, legacy: false,
+        user: DATABASE_USER.to_string(), password: Some(password), legacy: false,
         source: if existed { CredentialSource::Stored } else { CredentialSource::Generated },
     })
 }
@@ -415,12 +503,25 @@ pub fn ensure_encryption_key(data_dir: &Path) -> Result<String, String> {
 ///
 /// The credentials are passed through the process environment rather than the
 /// command line so they never appear in the process listing.
-pub fn build_credential_environment(credentials: &DatabaseCredentials) -> CredentialEnvironment {
-    CredentialEnvironment {
-        surreal_user: credentials.user.clone(),
-        surreal_password: credentials.password.clone(),
-        surreal_pass: credentials.password.clone(),
+///
+/// A `LegacyUnmigrated` install has no password yet, so this is fallible rather
+/// than defaulting to a usable value: inheriting `root` here is what let every
+/// host connect to a pre-existing datastore without anyone noticing.
+pub fn build_credential_environment(
+    credentials: &DatabaseCredentials,
+) -> Result<CredentialEnvironment, String> {
+    let password = credentials
+        .password
+        .as_deref()
+        .ok_or("Database credentials have not been provisioned; recovery is required")?;
+    if password.is_empty() || password.chars().any(|c| c.is_control()) {
+        return Err("Invalid credential value".into());
     }
+    Ok(CredentialEnvironment {
+        surreal_user: credentials.user.clone(),
+        surreal_password: password.to_string(),
+        surreal_pass: password.to_string(),
+    })
 }
 
 /// The user data directory used by the Tauri host.
@@ -438,15 +539,33 @@ mod tests {
     /// Go and C# hosts by `tests/contracts/credentials-cases.json`.
     const CASES: &str = include_str!("../../tests/contracts/credentials-cases.json");
 
-    /// Reads a flat string value out of the fixture.
-    fn case_value(cases: &str, name: &str) -> String {
-        let needle = format!("\"{}\"", name);
-        let start = cases.find(&needle).expect("fixture case") + needle.len();
-        let rest = &cases[start..];
-        let colon = rest.find(':').expect("fixture value") + 1;
-        let rest = rest[colon..].trim_start();
-        let end = rest.find(|c| c == ',' || c == '\n').unwrap_or(rest.len());
-        rest[..end].trim().trim_matches('"').to_string()
+    /// Parses the shared fixture.
+    fn cases() -> serde_json::Value {
+        serde_json::from_str(CASES).expect("fixture is valid JSON")
+    }
+
+    /// Maps an internal failure message onto the shared error-code vocabulary.
+    ///
+    /// The Rust API carries operator-facing messages rather than codes, so the
+    /// contract is asserted through this table: it is the single place where a
+    /// message change has to be reconciled with the fixture.
+    fn error_code(message: &str) -> &'static str {
+        match message {
+            "Credential file permissions are too open" => "permissions-too-open",
+            "Could not inspect datastore" => "datastore-unreadable",
+            "Invalid database credential file"
+            | "Existing datastore has no credential file; recovery is required" => {
+                "invalid-secrets-file"
+            }
+            "Invalid encoded credential"
+            | "Invalid credential encoding"
+            | "Invalid credential value"
+            | "Invalid encryption key"
+            | "Database credentials have not been provisioned; recovery is required" => {
+                "invalid-secret-value"
+            }
+            other => panic!("unmapped credential failure: {other}"),
+        }
     }
 
     #[test]
@@ -460,30 +579,29 @@ mod tests {
 
     #[test]
     fn derivation_matches_shared_vectors() {
-        let expected = [
-            (
-                "testuser",
-                "testhost",
-                "b1189a3224e146d49f8249f1a53a7c62bbebeaa9d9f2eccea151e08a0588fe93",
-            ),
-            (
-                "cruzmars",
-                "AMC-5RCSFW3",
-                "6a150e433a47f44192134ce516e9ffbefabc0bc4b465141a382247dc3dd14396",
-            ),
-        ];
-        for (username, hostname, hex) in expected {
+        let cases = cases();
+        let vectors = cases["derivationVectors"].as_array().expect("derivation vectors");
+        assert_eq!(vectors.len(), 4, "every shared derivation vector is checked");
+        for vector in vectors {
+            let username = vector["username"].as_str().expect("username");
+            let hostname = vector["hostname"].as_str().expect("hostname");
+            let hex = vector["keyHex"].as_str().expect("keyHex");
             let key = derive_obfuscation_key_from(username, hostname);
             let encoded: String = key.iter().map(|byte| format!("{:02x}", byte)).collect();
-            assert_eq!(encoded, hex, "derivation vector for {username}");
+            assert_eq!(encoded, hex, "derivation vector for {username}|{hostname}");
         }
     }
 
     #[test]
     fn obfuscation_matches_shared_vectors() {
-        let key = derive_obfuscation_key_from("testuser", "testhost");
-        let expected = case_value(CASES, "encodedSecret");
-        assert_eq!(encode_secret_with("s3cr3t-db-password", &key), expected);
+        let cases = cases();
+        let key = derive_obfuscation_key_from(
+            cases["encodedSecretKeyUsername"].as_str().expect("username"),
+            cases["encodedSecretKeyHostname"].as_str().expect("hostname"),
+        );
+        let expected = cases["encodedSecret"].as_str().expect("encodedSecret");
+        let plaintext = cases["encodedSecretPlaintext"].as_str().expect("plaintext");
+        assert_eq!(encode_secret_with(plaintext, &key), expected);
     }
 
     #[test]
@@ -496,10 +614,8 @@ mod tests {
     #[test]
     fn legacy_plaintext_is_returned_unchanged() {
         let key = derive_obfuscation_key_from("testuser", "testhost");
-        assert_eq!(
-            decode_secret_with("plaintext-legacy", &key),
-            "plaintext-legacy"
-        );
+        let plaintext = cases()["legacyPlaintextSecret"].as_str().expect("legacy plaintext").to_string();
+        assert_eq!(decode_secret_with(&plaintext, &key), plaintext);
     }
 
     #[test]
@@ -512,30 +628,62 @@ mod tests {
     }
 
     #[test]
+    fn acl_listings_are_classified_like_every_other_host() {
+        let cases = cases();
+        let samples = cases["aclSamples"].as_array().expect("acl samples");
+        assert!(samples.len() >= 10, "every shared ACL sample is checked");
+        for sample in samples {
+            let id = sample["id"].as_str().expect("sample id");
+            let expected = sample["restricted"].as_bool().expect("restricted");
+            let actual = match sample["platform"].as_str().expect("platform") {
+                "windows" => {
+                    let listing = sample["icaclsOutput"].as_str().expect("icaclsOutput");
+                    is_restricted_acl_listing(listing)
+                }
+                "posix" => {
+                    let mode = sample["mode"].as_u64().expect("mode") as u32;
+                    is_restricted_posix_mode(mode)
+                }
+                other => panic!("unknown ACL platform: {other}"),
+            };
+            assert_eq!(actual, expected, "ACL sample {id}");
+        }
+    }
+
+    #[test]
     fn fresh_install_generates_a_random_password() {
         let dir = tempdir("fresh");
         let credentials = resolve_database_credentials(&dir).unwrap();
         assert_eq!(credentials.user, DATABASE_USER);
         assert!(!credentials.legacy);
         assert_eq!(credentials.source, CredentialSource::Generated);
-        assert!(!credentials.password.is_empty());
+        let password = credentials.password.expect("password");
+        assert!(!password.is_empty());
 
         let secrets = fs::read_to_string(dir.join(SECRETS_FILENAME)).expect("secrets file");
         assert!(secrets.contains(OBFUSCATION_PREFIX));
-        assert!(!secrets.contains(&credentials.password));
+        assert!(!secrets.contains(&password));
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn existing_datastore_without_credentials_fails_closed() {
+    fn existing_datastore_without_credentials_is_reported_unmigrated() {
         let dir = tempdir("legacy");
-        let db = dir.join(DATABASE_DIRNAME).join(DATABASE_FILENAME);
-        fs::create_dir_all(&db).unwrap();
-        fs::write(db.join("CURRENT"), b"x").unwrap();
-        assert!(resolve_database_credentials(&dir).is_err());
+        seed_legacy_datastore(&dir);
+
+        let credentials = resolve_database_credentials(&dir).expect("legacy state, not an error");
+        assert_eq!(credentials.user, DATABASE_USER);
+        assert_eq!(credentials.password, None);
+        assert!(credentials.legacy);
+        assert_eq!(credentials.source, CredentialSource::LegacyUnmigrated);
+
+        // The callers must not be able to turn the state into a usable
+        // environment, and nothing may be written on the way through.
+        assert!(build_credential_environment(&credentials).is_err());
+        assert!(ensure_database_password(&dir).is_err());
         assert!(ensure_encryption_key(&dir).is_err());
         assert!(!dir.join(SECRETS_FILENAME).exists());
-        fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -552,11 +700,11 @@ mod tests {
     fn corrupt_credentials_are_preserved_and_rejected() {
         let dir = tempdir("corrupt");
         let file = dir.join(SECRETS_FILENAME);
-        fs::write(&file, "{not json").unwrap();
+        write_restricted(&file, "{not json");
         assert!(resolve_database_credentials(&dir).is_err());
         assert_eq!(fs::read(&file).unwrap(), b"{not json");
         let key = dir.join(KEY_FILENAME);
-        fs::write(&key, "obf:%%%").unwrap();
+        write_restricted(&key, "obf:%%%");
         assert!(ensure_encryption_key(&dir).is_err());
         assert_eq!(fs::read(&key).unwrap(), b"obf:%%%");
         fs::remove_dir_all(dir).unwrap();
@@ -590,13 +738,165 @@ mod tests {
     fn credential_environment_carries_the_password() {
         let environment = build_credential_environment(&DatabaseCredentials {
             user: DATABASE_USER.to_string(),
-            password: "s3cr3t".to_string(),
+            password: Some("s3cr3t".to_string()),
             legacy: false,
             source: CredentialSource::Generated,
-        });
+        })
+        .expect("environment");
         assert_eq!(environment.surreal_user, DATABASE_USER);
         assert_eq!(environment.surreal_password, "s3cr3t");
         assert_eq!(environment.surreal_pass, "s3cr3t");
+    }
+
+    #[test]
+    fn credential_environment_rejects_unusable_passwords() {
+        for password in [String::new(), "bad\u{7}secret".to_string()] {
+            let result = build_credential_environment(&DatabaseCredentials {
+                user: DATABASE_USER.to_string(),
+                password: Some(password),
+                legacy: false,
+                source: CredentialSource::Stored,
+            });
+            assert!(result.is_err(), "a control character or empty value is unusable");
+        }
+    }
+
+    #[test]
+    fn every_shared_credential_state_matches_the_fixture() {
+        let cases = cases();
+        let states = cases["states"].as_array().expect("states");
+        assert_eq!(states.len(), 10, "every shared credential state is checked");
+        for state in states {
+            let id = state["id"].as_str().expect("state id");
+            let dir = tempdir(&format!("state-{}", id.replace('-', "_")));
+            let secrets = dir.join(SECRETS_FILENAME);
+
+            match state["datastore"].as_str().expect("datastore") {
+                "present" => seed_legacy_datastore(&dir),
+                "unreadable" => {
+                    // A *file* where the datastore directory belongs cannot be
+                    // descended into, which makes the inspection fail portably.
+                    fs::write(dir.join(DATABASE_DIRNAME), b"not a directory").unwrap();
+                }
+                "absent" => {}
+                other => panic!("unknown datastore state: {other}"),
+            }
+
+            match state["secrets"].as_str().expect("secrets") {
+                "valid" => write_restricted(&secrets, &secrets_document(&encode_secret("shared-fixture-secret"))),
+                "corrupt" => write_restricted(&secrets, "{not json"),
+                "missing-field" => write_restricted(&secrets, "{\n  \"unrelated\": true\n}\n"),
+                "undecodable" => write_restricted(&secrets, &secrets_document("obf:!!!!")),
+                "empty" => write_restricted(&secrets, &secrets_document(&encode_secret(""))),
+                "control-char" => {
+                    write_restricted(&secrets, &secrets_document(&encode_secret("bad\u{7}secret")))
+                }
+                "absent" => {}
+                other => panic!("unknown secrets state: {other}"),
+            }
+
+            if state["acl"].as_str().expect("acl") == "open" {
+                widen_acl(&secrets);
+            }
+
+            let before = fs::read(&secrets).ok();
+            let result = resolve_database_credentials(&dir);
+
+            if state["outcome"].as_str().expect("outcome") == "rejected" {
+                let message = result.expect_err(&format!("{id}: expected a rejection"));
+                assert_eq!(
+                    error_code(&message),
+                    state["errorCode"].as_str().expect("errorCode"),
+                    "{id}: {message}"
+                );
+            } else {
+                let credentials = result.unwrap_or_else(|e| panic!("{id}: unexpected rejection: {e}"));
+                assert_eq!(
+                    source_name(credentials.source),
+                    state["source"].as_str().expect("source"),
+                    "{id}: source"
+                );
+                assert_eq!(credentials.legacy, state["legacy"].as_bool().expect("legacy"), "{id}: legacy");
+                assert_eq!(
+                    credentials.password.is_some(),
+                    state["passwordAvailable"].as_bool().expect("passwordAvailable"),
+                    "{id}: password availability"
+                );
+                if let Some(password) = &credentials.password {
+                    assert!(!password.is_empty(), "{id}: password must not be empty");
+                }
+            }
+
+            // No state ever rewrites the secrets file: an install must not lose
+            // the only copy of a password the datastore still accepts.
+            let writes = state["writesSecretsFile"].as_bool().expect("writesSecretsFile");
+            if let Some(before) = before {
+                if !writes {
+                    assert_eq!(fs::read(&secrets).ok(), Some(before), "{id}: secrets file was rewritten");
+                }
+            } else {
+                assert_eq!(secrets.exists(), writes, "{id}: secrets file appeared unexpectedly");
+            }
+
+            fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// The shared source vocabulary, so a fixture mismatch is a compile error.
+    fn source_name(source: CredentialSource) -> &'static str {
+        match source {
+            CredentialSource::LegacyUnmigrated => "legacy-unmigrated",
+            CredentialSource::Stored => "stored",
+            CredentialSource::Generated => "generated",
+        }
+    }
+
+    /// Renders a secrets file in the shared on-disk shape.
+    fn secrets_document(value: &str) -> String {
+        format!("{{\n  \"surrealPassword\": \"{}\"\n}}\n", value)
+    }
+
+    /// Creates the datastore directory a pre-existing install would have.
+    fn seed_legacy_datastore(dir: &Path) {
+        let db = dir.join(DATABASE_DIRNAME).join(DATABASE_FILENAME);
+        fs::create_dir_all(&db).unwrap();
+        fs::write(db.join("CURRENT"), b"x").unwrap();
+    }
+
+    /// Writes a secrets file with owner-only permissions.
+    fn write_restricted(file: &Path, contents: &str) {
+        if file.exists() {
+            fs::remove_file(file).unwrap();
+        }
+        protected_write(file, contents).expect("restricted write");
+    }
+
+    /// Makes a file readable by every local account, so the restriction check
+    /// has something real to reject.
+    fn widen_acl(file: &Path) {
+        #[cfg(windows)]
+        {
+            let status = std::process::Command::new("icacls")
+                .arg(file)
+                .arg("/grant")
+                // `*S-1-1-0` is Everyone by well-known SID, in a form that does
+                // not depend on the machine's locale.
+                .arg("*S-1-1-0:(R)")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("icacls");
+            assert!(status.success(), "could not widen the ACL");
+        }
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(file, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        assert!(
+            !check_restricted_to_current_user(file),
+            "the ACL was not actually widened"
+        );
     }
 
     /// Creates a unique temporary directory for a test.

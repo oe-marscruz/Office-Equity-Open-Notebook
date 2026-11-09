@@ -22,7 +22,7 @@ type App struct {
 func NewApp(enableProxy bool) *App {
 	runtimePath := ResolveRuntimePath()
 
-	homeDir, err := os.UserOptionDir()
+	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		homeDir = "."
 	}

@@ -43,23 +43,36 @@ func (p *NavigationPolicy) IsAllowedOrigin(targetURL string) bool {
 		parsedTarget.Host == parsedAllowed.Host
 }
 
+// NavigationAction classifies a navigation target the same way the Rust,
+// TypeScript and C# hosts do, so the shared compatibility fixture can be
+// replayed verbatim.
+//
+// It is also what HandleNavigation acts on, which keeps the decision the tests
+// assert and the decision the window makes in one place.
+func (p *NavigationPolicy) NavigationAction(targetURL string) string {
+	if p.IsAllowedOrigin(targetURL) {
+		return "allow"
+	}
+	parsed, err := url.Parse(targetURL)
+	if err != nil {
+		return "deny"
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https":
+		return "external"
+	default:
+		return "deny"
+	}
+}
+
 // HandleNavigation evaluates target URLs and delegates non-origin HTTP/HTTPS links to OS default browser.
 func (p *NavigationPolicy) HandleNavigation(targetURL string) (allowInWebView bool, err error) {
-	if p.IsAllowedOrigin(targetURL) {
+	switch p.NavigationAction(targetURL) {
+	case "allow":
 		return true, nil
+	case "external":
+		return false, OpenInSystemBrowser(targetURL)
 	}
-
-	// Deny file URIs and invalid schemes entirely
-	if strings.HasPrefix(targetURL, "file://") {
-		return false, fmt.Errorf("file URI scheme prohibited: %s", targetURL)
-	}
-
-	// Delegate external web links to the default system browser
-	if strings.HasPrefix(targetURL, "http://") || strings.HasPrefix(targetURL, "https://") {
-		err := OpenInSystemBrowser(targetURL)
-		return false, err
-	}
-
 	return false, fmt.Errorf("prohibited scheme or untrusted origin: %s", targetURL)
 }
 

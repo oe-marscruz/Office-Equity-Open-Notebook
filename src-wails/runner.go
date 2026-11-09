@@ -121,9 +121,18 @@ func (sm *ServiceManager) StartServices() error {
 	// Resolve the per-install database credentials and the provider-API-key
 	// encryption key. The credentials travel through the child environment
 	// rather than the command line so they never appear in a process listing.
-	credentials := ResolveDatabaseCredentials(sm.DataDir)
-	credentialEnv := BuildCredentialEnvironment(credentials)
-	encryptionKey := EnsureEncryptionKey(sm.DataDir)
+	credentials, err := ResolveDatabaseCredentials(sm.DataDir)
+	if err != nil {
+		return err
+	}
+	credentialEnv, err := BuildCredentialEnvironment(credentials)
+	if err != nil {
+		return err
+	}
+	encryptionKey, err := EnsureEncryptionKey(sm.DataDir)
+	if err != nil {
+		return err
+	}
 
 	backendEnv := map[string]string{
 		"OPEN_NOTEBOOK_ENCRYPTION_KEY": encryptionKey,

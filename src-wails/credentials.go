@@ -27,8 +27,14 @@ package main
 // SurrealDB applies the initial root credentials only when no root user exists
 // yet. A datastore created by an older build already has a root user, so a
 // newly generated password has no effect and the backend would be locked out
-// of its own data. Existing datastores therefore keep their original root
-// password; only fresh installs receive a random one.
+// of its own data.
+//
+// An existing datastore with no secrets file is therefore reported as
+// CredentialSourceLegacyUnmigrated, carrying no password at all, so the caller
+// has to run the migration instead of quietly connecting as root. A damaged
+// secrets file is reported and left untouched: it may still hold the only copy
+// of the password the datastore accepts, and rewriting it would turn a
+// recoverable problem into a lockout.
 //
 // # Cross-language on-disk contract
 //
@@ -52,6 +58,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -59,6 +66,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"unicode"
 )
 
 const (
@@ -93,20 +101,54 @@ const (
 type CredentialSource string
 
 const (
-	// CredentialSourceLegacy means the install predates per-install
-	// credentials and keeps root/root.
-	CredentialSourceLegacy CredentialSource = "legacy"
+	// CredentialSourceLegacyUnmigrated means a datastore exists but no secrets
+	// file does: the install predates per-install credentials and needs an
+	// explicit migration. No password is returned for this state.
+	CredentialSourceLegacyUnmigrated CredentialSource = "legacy-unmigrated"
 	// CredentialSourceStored means the password was read back from disk.
 	CredentialSourceStored CredentialSource = "stored"
 	// CredentialSourceGenerated means the password was generated this run.
 	CredentialSourceGenerated CredentialSource = "generated"
 )
 
+// The failure modes every host reports for the same on-disk situation.
+const (
+	CredentialErrorInvalidSecretsFile  = "invalid-secrets-file"
+	CredentialErrorInvalidSecretValue  = "invalid-secret-value"
+	CredentialErrorPermissionsTooOpen  = "permissions-too-open"
+	CredentialErrorDatastoreUnreadable = "datastore-unreadable"
+)
+
+// CredentialError is a credential failure with a machine-readable code, so
+// callers can tell a damaged secret from a permissions problem without
+// matching on prose.
+type CredentialError struct {
+	Code    string
+	Message string
+	Path    string
+}
+
+// Error renders the failure with the file it concerns.
+func (e *CredentialError) Error() string {
+	if e.Path == "" {
+		return e.Message
+	}
+	return fmt.Sprintf("%s: %s", e.Message, e.Path)
+}
+
+// newCredentialError builds a CredentialError.
+func newCredentialError(code, message, path string) error {
+	return &CredentialError{Code: code, Message: message, Path: path}
+}
+
 // DatabaseCredentials are the SurrealDB credentials to start the database
 // with.
+//
+// Password is nil until the install has been provisioned: a legacy install
+// carries no password so no caller can accidentally connect with one.
 type DatabaseCredentials struct {
 	User     string
-	Password string
+	Password *string
 	Legacy   bool
 	Source   CredentialSource
 }
@@ -231,17 +273,42 @@ func EncodeSecretWith(secret string, key []byte) string {
 // DecodeSecretWith decodes a stored secret value against an explicit key.
 //
 // Values written before the obfuscated format existed are stored in plaintext
-// and are returned unchanged, so existing installs keep working.
-func DecodeSecretWith(stored string, key []byte) string {
+// and are returned unchanged, so existing installs keep working. A value that
+// carries the prefix but cannot be decoded is an error rather than a silent
+// fallback to the raw string: the raw string is not the password.
+func DecodeSecretWith(stored string, key []byte) (string, error) {
 	raw := strings.TrimSpace(stored)
 	if !strings.HasPrefix(raw, ObfuscationPrefix) {
-		return raw
+		if err := validateSecretValue(raw); err != nil {
+			return "", err
+		}
+		return raw, nil
 	}
 	obfuscated, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(raw, ObfuscationPrefix))
 	if err != nil {
-		return raw
+		return "", newCredentialError(CredentialErrorInvalidSecretValue, "Invalid encoded credential", "")
 	}
-	return string(XorObfuscate(obfuscated, key))
+	decoded := string(XorObfuscate(obfuscated, key))
+	if err := validateSecretValue(decoded); err != nil {
+		return "", err
+	}
+	return decoded, nil
+}
+
+// validateSecretValue rejects values that cannot be a password.
+//
+// An empty value would make the server accept connections with no password and
+// a control character cannot survive a process environment or a CLI argument.
+func validateSecretValue(value string) error {
+	if value == "" {
+		return newCredentialError(CredentialErrorInvalidSecretValue, "Invalid credential value", "")
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return newCredentialError(CredentialErrorInvalidSecretValue, "Invalid credential value", "")
+		}
+	}
+	return nil
 }
 
 // EncodeSecret obfuscates a secret with the machine-bound key.
@@ -250,172 +317,354 @@ func EncodeSecret(secret string) string {
 }
 
 // DecodeSecret decodes a stored secret value with the machine-bound key.
-func DecodeSecret(stored string) string {
+func DecodeSecret(stored string) (string, error) {
 	return DecodeSecretWith(stored, DeriveObfuscationKey())
 }
 
 // RestrictToCurrentUser restricts a file to the current OS user.
 //
-// This is best effort by design: a failure here must never stop the app from
-// starting, so every error is swallowed.
-func RestrictToCurrentUser(file string) bool {
+// The restriction is verified afterwards rather than assumed: icacls can report
+// success while a second ACE still exposes the secret, and a POSIX mode can be
+// widened again after the fact.
+func RestrictToCurrentUser(file string) error {
 	if runtime.GOOS == "windows" {
 		name := strings.TrimSpace(os.Getenv("USERNAME"))
 		if name == "" {
-			return false
+			return newCredentialError(CredentialErrorPermissionsTooOpen, "Could not determine the current user", file)
 		}
 		cmd := exec.Command("icacls", file, "/inheritance:r", "/grant:r", name+":F")
-		return cmd.Run() == nil
+		if err := cmd.Run(); err != nil {
+			return newCredentialError(CredentialErrorPermissionsTooOpen, "Could not restrict credential file permissions", file)
+		}
+	} else if err := os.Chmod(file, 0600); err != nil {
+		return newCredentialError(CredentialErrorPermissionsTooOpen, "Could not restrict credential file permissions", file)
 	}
-	return os.Chmod(file, 0600) == nil
+	return CheckRestrictedToCurrentUser(file)
 }
 
-// writeSecretFile writes contents to file and restricts it to the current
-// OS user.
-func writeSecretFile(file, contents string) {
+// CheckRestrictedToCurrentUser reports whether file is provably readable only
+// by the current OS user.
+func CheckRestrictedToCurrentUser(file string) error {
+	if runtime.GOOS == "windows" {
+		output, err := exec.Command("icacls", file).Output()
+		if err != nil {
+			return newCredentialError(CredentialErrorPermissionsTooOpen, "Could not inspect credential file permissions", file)
+		}
+		if !IsRestrictedACLListing(string(output)) {
+			return newCredentialError(CredentialErrorPermissionsTooOpen, "Credential file permissions are too open", file)
+		}
+		return nil
+	}
+	info, err := os.Stat(file)
+	if err != nil {
+		return newCredentialError(CredentialErrorPermissionsTooOpen, "Could not inspect credential file permissions", file)
+	}
+	if !IsRestrictedPosixMode(uint32(info.Mode().Perm())) {
+		return newCredentialError(CredentialErrorPermissionsTooOpen, "Credential file permissions are too open", file)
+	}
+	return nil
+}
+
+// IsRestrictedACLListing classifies icacls output as owner-only or not.
+//
+// icacls interleaves diagnostics ("Successfully processed ...", an unresolved
+// domain trust, a mandatory-integrity label) with the ACL itself, so the ACE
+// lines are isolated before counting. Exactly one non-inherited full-control
+// ACE is the only accepted shape.
+func IsRestrictedACLListing(listing string) bool {
+	aces := make([]string, 0, 4)
+	for _, line := range strings.Split(listing, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" ||
+			strings.HasPrefix(trimmed, "Successfully processed") ||
+			strings.HasPrefix(trimmed, "Failed processing") ||
+			strings.HasPrefix(trimmed, "The trust relationship") ||
+			strings.HasPrefix(trimmed, "Mandatory Label") {
+			continue
+		}
+		aces = append(aces, trimmed)
+	}
+	if len(aces) != 1 {
+		return false
+	}
+	ace := aces[0]
+	return !strings.Contains(ace, "(I)") && strings.HasSuffix(ace, "(F)")
+}
+
+// IsRestrictedPosixMode reports whether a POSIX mode grants nothing to group or
+// other.
+func IsRestrictedPosixMode(mode uint32) bool {
+	return mode&0o077 == 0
+}
+
+// writeSecretFile writes contents to file and restricts it to the current OS
+// user, failing rather than leaving an unrestricted secret behind.
+func writeSecretFile(file, contents string) error {
 	if err := os.MkdirAll(filepath.Dir(file), 0755); err != nil {
-		return
+		return newCredentialError(CredentialErrorInvalidSecretsFile, "Could not create credential directory", file)
 	}
-	if err := os.WriteFile(file, []byte(contents), 0600); err != nil {
-		return
+	handle, err := os.OpenFile(file, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return newCredentialError(CredentialErrorInvalidSecretsFile, "Could not create credential file", file)
 	}
-	RestrictToCurrentUser(file)
+	if err := RestrictToCurrentUser(file); err != nil {
+		handle.Close()
+		return err
+	}
+	if _, err := handle.WriteString(contents); err != nil {
+		handle.Close()
+		return newCredentialError(CredentialErrorInvalidSecretsFile, "Could not write credential file", file)
+	}
+	if err := handle.Sync(); err != nil {
+		handle.Close()
+		return newCredentialError(CredentialErrorInvalidSecretsFile, "Could not persist credential file", file)
+	}
+	return handle.Close()
+}
+
+// readProtectedSecretFile reads a secret file, or returns ("", false, nil) when
+// it does not exist.
+//
+// The permissions are checked rather than repaired: a file other accounts can
+// read may already have exposed the secret, and silently tightening the ACL
+// would hide that from the user.
+func readProtectedSecretFile(file string) (string, bool, error) {
+	contents, err := os.ReadFile(file)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", false, nil
+		}
+		return "", false, newCredentialError(CredentialErrorInvalidSecretsFile, "Could not read credential file", file)
+	}
+	if err := CheckRestrictedToCurrentUser(file); err != nil {
+		return "", false, err
+	}
+	return string(contents), true, nil
 }
 
 // HasExistingDatastore reports whether dataDir already holds a SurrealDB
 // datastore from an earlier run.
 //
 // RocksDB stores its datastore in a directory, which reports a size of 0 on
-// Windows, so both shapes have to be checked.
-func HasExistingDatastore(dataDir string) bool {
-	file := filepath.Join(dataDir, DatabaseDirname, DatabaseFilename)
+// Windows, so both shapes have to be checked. Inspection failures are errors
+// rather than "false": reporting a fresh install for an unreadable datastore
+// would overwrite the credentials of an install that still works.
+func HasExistingDatastore(dataDir string) (bool, error) {
+	dir := filepath.Join(dataDir, DatabaseDirname)
+	file := filepath.Join(dir, DatabaseFilename)
+	// A datastore path occupied by something other than a directory cannot be
+	// inspected. Windows reports this shape as "not found" all the way down,
+	// which would otherwise be indistinguishable from a fresh install.
+	if dirInfo, dirErr := os.Stat(dir); dirErr == nil && !dirInfo.IsDir() {
+		return false, newCredentialError(CredentialErrorDatastoreUnreadable, "Could not inspect datastore", dir)
+	}
 	info, err := os.Stat(file)
 	if err != nil {
-		return false
+		if !errors.Is(err, os.ErrNotExist) {
+			return false, newCredentialError(CredentialErrorDatastoreUnreadable, "Could not inspect datastore", file)
+		}
+		// The file is absent. The directory itself still has to be
+		// inspectable: a directory that exists but cannot be listed hides a
+		// legacy datastore just as effectively as an unreadable file does.
+		if _, dirErr := os.ReadDir(dir); dirErr != nil {
+			if errors.Is(dirErr, os.ErrNotExist) {
+				return false, nil
+			}
+			return false, newCredentialError(CredentialErrorDatastoreUnreadable, "Could not inspect datastore", dir)
+		}
+		return false, nil
 	}
 	if info.IsDir() {
 		entries, err := os.ReadDir(file)
 		if err != nil {
-			return false
+			return false, newCredentialError(CredentialErrorDatastoreUnreadable, "Could not inspect datastore", file)
 		}
-		return len(entries) > 0
+		return len(entries) > 0, nil
 	}
-	return info.Size() > 0
+	return info.Size() > 0, nil
 }
 
 // EnsureDatabasePassword returns the persisted database password for dataDir,
 // generating one on first use.
-func EnsureDatabasePassword(dataDir string) string {
+//
+// A secrets file that cannot be parsed or decoded is reported and left
+// untouched: it may still hold the only copy of the password the datastore
+// accepts, and rewriting it would turn a recoverable problem into a lockout.
+// The legacy-unmigrated case is signalled by ResolveDatabaseCredentials, not
+// here.
+func EnsureDatabasePassword(dataDir string) (string, error) {
 	secretsFile := filepath.Join(dataDir, SecretsFilename)
-	if contents, err := os.ReadFile(secretsFile); err == nil {
+	contents, exists, err := readProtectedSecretFile(secretsFile)
+	if err != nil {
+		return "", err
+	}
+	if exists {
 		var parsed struct {
 			SurrealPassword string `json:"surrealPassword"`
 		}
-		if err := json.Unmarshal(contents, &parsed); err == nil && parsed.SurrealPassword != "" {
-			return DecodeSecret(parsed.SurrealPassword)
+		if err := json.Unmarshal([]byte(contents), &parsed); err != nil || parsed.SurrealPassword == "" {
+			return "", newCredentialError(CredentialErrorInvalidSecretsFile, "Invalid database credential file", secretsFile)
 		}
-		// A corrupt secrets file is rewritten below rather than crashing
-		// startup.
+		return DecodeSecret(parsed.SurrealPassword)
 	}
-
-	password := randomPassword()
+	found, err := HasExistingDatastore(dataDir)
+	if err != nil {
+		return "", err
+	}
+	if found {
+		return "", newCredentialError(CredentialErrorInvalidSecretsFile, "Existing datastore has no credential file; recovery is required", secretsFile)
+	}
+	password, err := randomPassword()
+	if err != nil {
+		return "", err
+	}
 	encoded, err := json.MarshalIndent(map[string]string{
 		"surrealPassword": EncodeSecret(password),
 	}, "", "  ")
 	if err != nil {
-		return password
+		return "", newCredentialError(CredentialErrorInvalidSecretsFile, "Could not serialize database credential", secretsFile)
 	}
-	writeSecretFile(secretsFile, string(encoded)+"\n")
-	return password
+	if err := writeSecretFile(secretsFile, string(encoded)+"\n"); err != nil {
+		return "", err
+	}
+	return password, nil
 }
 
 // randomPassword generates a random base64url password.
-func randomPassword() string {
+//
+// A random-source failure stops startup: a deterministic placeholder would be
+// a publicly known password on a loopback service.
+func randomPassword() (string, error) {
 	buffer := make([]byte, DatabasePasswordBytes)
 	if _, err := rand.Read(buffer); err != nil {
-		// A failure here must not block startup; fall back to a fixed-length
-		// placeholder that is still unique enough to be unusable by default.
-		for i := range buffer {
-			buffer[i] = byte(i * 7)
-		}
+		return "", newCredentialError(CredentialErrorInvalidSecretValue, "Secure random generator failed", "")
 	}
-	return base64.RawURLEncoding.EncodeToString(buffer)
+	return base64.RawURLEncoding.EncodeToString(buffer), nil
 }
 
 // ResolveDatabaseCredentials resolves the SurrealDB credentials to start the
 // database with.
 //
-// SurrealDB applies the initial root credentials only when no root user
-// exists yet, so a freshly generated password has no effect on a datastore
-// created by an older build: the stored root credentials win and the backend
-// would be locked out of its own data. Existing datastores therefore keep
-// their original password so upgrades never lose notebook content; only new
-// installs get a random one.
-func ResolveDatabaseCredentials(dataDir string) DatabaseCredentials {
+// Every host reports one of three states for the same on-disk situation:
+// "generated" for a fresh install, "stored" for a readable secrets file, and
+// "legacy-unmigrated" for a datastore without a secrets file. The last one
+// carries no password, because SurrealDB applies the initial root credentials
+// only when no root user exists yet: a password invented here would have no
+// effect and the backend would be locked out of its own data.
+func ResolveDatabaseCredentials(dataDir string) (DatabaseCredentials, error) {
 	secretsFile := filepath.Join(dataDir, SecretsFilename)
 	_, statErr := os.Stat(secretsFile)
 	hadSecrets := statErr == nil
+	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return DatabaseCredentials{}, newCredentialError(CredentialErrorInvalidSecretsFile, "Could not inspect database credential file", secretsFile)
+	}
 
-	if HasExistingDatastore(dataDir) && !hadSecrets {
-		return DatabaseCredentials{
-			User:     DatabaseUser,
-			Password: LegacyDatabasePassword,
-			Legacy:   true,
-			Source:   CredentialSourceLegacy,
+	if !hadSecrets {
+		found, err := HasExistingDatastore(dataDir)
+		if err != nil {
+			return DatabaseCredentials{}, err
+		}
+		if found {
+			return DatabaseCredentials{
+				User:     DatabaseUser,
+				Password: nil,
+				Legacy:   true,
+				Source:   CredentialSourceLegacyUnmigrated,
+			}, nil
 		}
 	}
 
-	password := EnsureDatabasePassword(dataDir)
+	password, err := EnsureDatabasePassword(dataDir)
+	if err != nil {
+		return DatabaseCredentials{}, err
+	}
 	source := CredentialSourceGenerated
 	if hadSecrets {
 		source = CredentialSourceStored
 	}
 	return DatabaseCredentials{
 		User:     DatabaseUser,
-		Password: password,
+		Password: &password,
 		Legacy:   false,
 		Source:   source,
-	}
+	}, nil
 }
 
 // EnsureEncryptionKey returns the persisted encryption key for dataDir,
 // generating a random 32-byte key on first use.
 //
-// The key is stored obfuscated so it never appears in plaintext on disk.
-// Legacy plaintext key files are still readable, but new keys use the
-// obfuscated format.
-func EnsureEncryptionKey(dataDir string) string {
+// The key is stored obfuscated so it never appears in plaintext on disk. Legacy
+// plaintext key files are still readable, but any stored key must have the
+// documented shape: a key of the wrong length or alphabet cannot encrypt
+// anything and must be reported rather than replaced.
+func EnsureEncryptionKey(dataDir string) (string, error) {
 	keyFile := filepath.Join(dataDir, KeyFilename)
-	if contents, err := os.ReadFile(keyFile); err == nil {
-		if existing := DecodeSecret(string(contents)); existing != "" {
-			return existing
-		}
+	contents, exists, err := readProtectedSecretFile(keyFile)
+	if err != nil {
+		return "", err
 	}
-
+	if exists {
+		key, err := DecodeSecret(contents)
+		if err != nil {
+			return "", newCredentialError(CredentialErrorInvalidSecretValue, "Invalid encryption key", keyFile)
+		}
+		if len(key) != EncryptionKeyBytes*2 || !isLowerHex(key) {
+			return "", newCredentialError(CredentialErrorInvalidSecretValue, "Invalid encryption key", keyFile)
+		}
+		return key, nil
+	}
+	found, err := HasExistingDatastore(dataDir)
+	if err != nil {
+		return "", err
+	}
+	if found {
+		return "", newCredentialError(CredentialErrorInvalidSecretsFile, "Existing datastore has no encryption key; recovery is required", keyFile)
+	}
 	buffer := make([]byte, EncryptionKeyBytes)
 	if _, err := rand.Read(buffer); err != nil {
-		for i := range buffer {
-			buffer[i] = byte(i * 13)
-		}
+		return "", newCredentialError(CredentialErrorInvalidSecretValue, "Secure random generator failed", "")
 	}
 	key := hex.EncodeToString(buffer)
-	writeSecretFile(keyFile, EncodeSecret(key))
-	return key
+	if err := writeSecretFile(keyFile, EncodeSecret(key)); err != nil {
+		return "", err
+	}
+	return key, nil
+}
+
+// isLowerHex reports whether value is 64 lowercase hex digits or similar: the
+// on-disk shape of the encryption key.
+func isLowerHex(value string) bool {
+	for _, r := range value {
+		if !strings.ContainsRune("0123456789abcdefABCDEF", r) {
+			return false
+		}
+	}
+	return true
 }
 
 // BuildCredentialEnvironment builds the environment variables that carry the
 // database credentials to the SurrealDB server and the Python backend.
 //
-// SurrealDB's own CLI reads SURREAL_USER and SURREAL_PASS. The upstream
-// backend reads SURREAL_USER and SURREAL_PASSWORD, falling back to
-// SURREAL_PASS. Both are therefore set to the same value.
+// SurrealDB's own CLI reads SURREAL_USER and SURREAL_PASS. The upstream backend
+// reads SURREAL_USER and SURREAL_PASSWORD, falling back to SURREAL_PASS. Both
+// are therefore set to the same value.
 //
 // The credentials are passed through the process environment rather than the
 // command line so they never appear in the process listing.
-func BuildCredentialEnvironment(credentials DatabaseCredentials) CredentialEnvironment {
+//
+// A legacy-unmigrated install has no password yet, so this is fallible rather
+// than defaulting to a usable value: inheriting root here is what let every
+// host connect to a pre-existing datastore without anyone noticing.
+func BuildCredentialEnvironment(credentials DatabaseCredentials) (CredentialEnvironment, error) {
+	if credentials.Password == nil {
+		return CredentialEnvironment{}, newCredentialError(CredentialErrorInvalidSecretValue, "Database credentials have not been provisioned; recovery is required", "")
+	}
+	if err := validateSecretValue(*credentials.Password); err != nil {
+		return CredentialEnvironment{}, err
+	}
 	return CredentialEnvironment{
 		SurrealUser:     credentials.User,
-		SurrealPassword: credentials.Password,
-		SurrealPass:     credentials.Password,
-	}
+		SurrealPassword: *credentials.Password,
+		SurrealPass:     *credentials.Password,
+	}, nil
 }

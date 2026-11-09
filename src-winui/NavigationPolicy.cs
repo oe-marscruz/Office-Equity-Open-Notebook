@@ -25,30 +25,44 @@ namespace OfficeEquityOpenNotebook
                    targetUri.Port == allowedUri.Port;
         }
 
-        public bool HandleNavigation(string targetUrl, out bool allowInWebView)
+        /// <summary>
+        /// Classifies a navigation target as "allow", "external" or "deny".
+        ///
+        /// This mirrors the Rust, TypeScript and Go hosts so the shared
+        /// compatibility fixture can be replayed verbatim. It is also what
+        /// <see cref="HandleNavigation"/> acts on, which keeps the decision the
+        /// tests assert and the decision the window makes in one place.
+        /// </summary>
+        public string NavigationAction(string targetUrl)
         {
-            allowInWebView = false;
-
             if (IsAllowedOrigin(targetUrl))
             {
-                allowInWebView = true;
-                return true;
+                return "allow";
             }
-
-            if (targetUrl.StartsWith("file://", StringComparison.OrdinalIgnoreCase))
+            if (!Uri.TryCreate(targetUrl, UriKind.Absolute, out Uri? targetUri))
             {
-                Console.WriteLine($"[SECURITY] Blocked file URI scheme navigation: {targetUrl}");
-                return false;
+                return "deny";
             }
+            string scheme = targetUri.Scheme.ToLowerInvariant();
+            return scheme is "http" or "https" ? "external" : "deny";
+        }
 
-            if (targetUrl.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
-                targetUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+        public bool HandleNavigation(string targetUrl, out bool allowInWebView)
+        {
+            switch (NavigationAction(targetUrl))
             {
-                return OpenInSystemBrowser(targetUrl);
+                case "allow":
+                    allowInWebView = true;
+                    return true;
+                case "external":
+                    allowInWebView = false;
+                    Console.WriteLine($"[SECURITY] Delegated external navigation to the system browser: {targetUrl}");
+                    return OpenInSystemBrowser(targetUrl);
+                default:
+                    allowInWebView = false;
+                    Console.WriteLine($"[SECURITY] Prohibited scheme or untrusted origin: {targetUrl}");
+                    return false;
             }
-
-            Console.WriteLine($"[SECURITY] Prohibited scheme or untrusted origin: {targetUrl}");
-            return false;
         }
 
         public static bool OpenInSystemBrowser(string targetUrl)

@@ -118,12 +118,12 @@ export function createBackendEnvironment(params: {
   /**
    * The resolved SurrealDB credentials for this install.
    *
-   * When omitted, the legacy fixed `root` password is used. That keeps the
-   * contract helpers usable without touching the filesystem, but it is *not*
-   * a secure default: every launcher resolves real credentials through
-   * `scripts/lib/credentials.js` and passes them in here.
+   * Required, and never defaulted. Every launcher resolves real credentials
+   * through `scripts/lib/credentials.js`; defaulting to the legacy `root`
+   * password here would silently reopen the lockout the credential contract
+   * exists to prevent.
    */
-  credentials?: { user: string; password: string } | undefined;
+  credentials: { user: string; password: string };
 }): BackendEnvironment {
   const {
     backendPath,
@@ -136,8 +136,14 @@ export function createBackendEnvironment(params: {
     credentials,
   } = params;
 
-  const surrealUser = credentials?.user ?? 'root';
-  const surrealPassword = credentials?.password ?? 'root';
+  if (!credentials || !credentials.user || !credentials.password) {
+    throw new Error(
+      'createBackendEnvironment requires resolved database credentials; ' +
+        'pass the result of resolveDatabaseCredentials()'
+    );
+  }
+  const surrealUser = credentials.user;
+  const surrealPassword = credentials.password;
 
   const doclingValue =
     typeof enableDocling === 'boolean'

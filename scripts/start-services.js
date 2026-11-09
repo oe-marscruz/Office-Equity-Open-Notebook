@@ -16,6 +16,8 @@ const { spawnServiceProcess } = require('./service-diagnostics');
 const {
   buildCredentialEnvironment,
   resolveDatabaseCredentials,
+  CredentialError,
+  CREDENTIAL_ERROR_INVALID_SECRETS_FILE,
 } = require('./lib/credentials');
 const net = require('net');
 const http = require('http');
@@ -224,7 +226,16 @@ async function startServices(cfg) {
   // install has its own random password instead of a fixed `root`/`root`.
   // They travel through the process environment rather than the command line
   // so they never appear in a process listing.
+  //
+  // A legacy-unmigrated install has no password at all; that is reported to
+  // the caller instead of being papered over with the old fixed password.
   const credentials = cfg.credentials || resolveDatabaseCredentials(dataDir);
+  if (credentials.source === 'legacy-unmigrated' || !credentials.password) {
+    throw new CredentialError(
+      'Existing datastore has no credential file; recovery is required',
+      CREDENTIAL_ERROR_INVALID_SECRETS_FILE
+    );
+  }
   const credentialEnv = buildCredentialEnvironment(credentials);
 
   const backendEnv = {

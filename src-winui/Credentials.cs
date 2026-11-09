@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -9,17 +11,80 @@ namespace OfficeEquityOpenNotebook
 {
     /// <summary>
     /// Where a resolved database password came from.
+    ///
+    /// These are the stable string identifiers of the cross-host contract; the
+    /// names are asserted against <c>tests/contracts/credentials-cases.json</c>
+    /// in every host's test suite.
     /// </summary>
     public enum CredentialSource
     {
-        /// <summary>The install predates per-install credentials and keeps root/root.</summary>
-        Legacy,
+        /// <summary>
+        /// The install predates per-install credentials: a datastore exists and
+        /// no secrets file does. No password is available until a migration
+        /// runs, so callers have to handle this case explicitly.
+        /// </summary>
+        LegacyUnmigrated,
 
         /// <summary>The password was read back from an existing secret store.</summary>
         Stored,
 
         /// <summary>The password was generated on this run.</summary>
         Generated,
+    }
+
+    /// <summary>
+    /// The stable <see cref="CredentialSource"/> identifiers.
+    /// </summary>
+    public static class CredentialSources
+    {
+        public const string LegacyUnmigrated = "legacy-unmigrated";
+        public const string Stored = "stored";
+        public const string Generated = "generated";
+
+        /// <summary>Renders a source as its cross-host identifier.</summary>
+        public static string ToIdentifier(CredentialSource source)
+        {
+            return source switch
+            {
+                CredentialSource.LegacyUnmigrated => LegacyUnmigrated,
+                CredentialSource.Stored => Stored,
+                CredentialSource.Generated => Generated,
+                _ => throw new ArgumentOutOfRangeException(nameof(source)),
+            };
+        }
+    }
+
+    /// <summary>
+    /// The stable error codes a <see cref="CredentialException"/> can carry.
+    ///
+    /// Launchers render host-appropriate guidance from the code rather than
+    /// matching on message text, which keeps the wording free to change.
+    /// </summary>
+    public static class CredentialErrorCodes
+    {
+        public const string InvalidSecretsFile = "invalid-secrets-file";
+        public const string InvalidSecretValue = "invalid-secret-value";
+        public const string PermissionsTooOpen = "permissions-too-open";
+        public const string DatastoreUnreadable = "datastore-unreadable";
+    }
+
+    /// <summary>
+    /// Thrown when the credential store cannot be used safely.
+    /// </summary>
+    public sealed class CredentialException : Exception
+    {
+        public CredentialException(string message, string code, string? path = null)
+            : base(message)
+        {
+            Code = code;
+            Path = path;
+        }
+
+        /// <summary>One of the <see cref="CredentialErrorCodes"/> identifiers.</summary>
+        public string Code { get; }
+
+        /// <summary>The file or directory the failure concerns, when known.</summary>
+        public string? Path { get; }
     }
 
     /// <summary>
@@ -30,14 +95,21 @@ namespace OfficeEquityOpenNotebook
         /// <summary>The SurrealDB user name.</summary>
         public string User { get; set; } = string.Empty;
 
-        /// <summary>The SurrealDB password.</summary>
-        public string Password { get; set; } = string.Empty;
+        /// <summary>
+        /// The SurrealDB password, or null when the install is
+        /// <see cref="CredentialSource.LegacyUnmigrated"/> and no password can
+        /// be obtained without a migration.
+        /// </summary>
+        public string? Password { get; set; }
 
-        /// <summary>True when the install still uses the legacy root/root credential.</summary>
+        /// <summary>True when the install needs an explicit credential migration.</summary>
         public bool Legacy { get; set; }
 
         /// <summary>Where the password came from.</summary>
         public CredentialSource Source { get; set; }
+
+        /// <summary>The source as its cross-host identifier.</summary>
+        public string SourceIdentifier => CredentialSources.ToIdentifier(Source);
     }
 
     /// <summary>
@@ -95,8 +167,11 @@ namespace OfficeEquityOpenNotebook
     /// SurrealDB applies the initial root credentials only when no root user
     /// exists yet. A datastore created by an older build already has a root
     /// user, so a newly generated password has no effect and the backend would
-    /// be locked out of its own data. Existing datastores therefore keep their
-    /// original root password; only fresh installs receive a random one.
+    /// be locked out of its own data. A datastore that has no secrets file is
+    /// therefore reported as <see cref="CredentialSource.LegacyUnmigrated"/>
+    /// with a null password, and every caller has to handle the migration
+    /// explicitly. Handing back the legacy `root` password instead is what
+    /// made the condition invisible.
     ///
     /// Cross-language on-disk contract
     /// -------------------------------
@@ -122,7 +197,17 @@ namespace OfficeEquityOpenNotebook
         /// <summary>File holding the obfuscated SurrealDB root password.</summary>
         public const string SecretsFilename = "secrets.json";
 
-        /// <summary>The root password used by builds that predate per-install credentials.</summary>
+        /// <summary>
+        /// The fixed password written by builds that predate per-install
+        /// credentials.
+        ///
+        /// Retained only so the migration path can explicitly ask to try it
+        /// once against an existing datastore. No resolution path returns this
+        /// value: <see cref="ResolveDatabaseCredentials"/> reports
+        /// <see cref="CredentialSource.LegacyUnmigrated"/> with a null password
+        /// instead, so a caller that forgets to handle migration fails loudly
+        /// rather than quietly connecting as root.
+        /// </summary>
         public const string LegacyDatabasePassword = "root";
 
         /// <summary>The SurrealDB root username. Fixed, because it is not itself a secret.</summary>
@@ -325,28 +410,285 @@ namespace OfficeEquityOpenNotebook
             return EncodeSecretWith(secret, DeriveObfuscationKey());
         }
 
-        /// <summary>Decodes a stored secret value with the machine-bound key.</summary>
+        /// <summary>
+        /// Decodes a stored secret value with the machine-bound key.
+        ///
+        /// Values written before the obfuscated format existed are stored in
+        /// plaintext and are returned unchanged, so existing installs keep
+        /// working.
+        /// </summary>
         public static string DecodeSecret(string stored)
         {
             return DecodeSecretWith(stored, DeriveObfuscationKey());
         }
 
         /// <summary>
-        /// Restricts a file to the current OS user.
+        /// Decodes a stored secret value with validation.
         ///
-        /// This is best effort by design: a failure here must never stop the
-        /// app from starting, so every error is swallowed.
+        /// Mirrors the Rust <c>decode_checked</c> and the JavaScript
+        /// <c>decodeSecretChecked</c>: a value carrying the obfuscation prefix
+        /// must be strict base64, must decode to valid UTF-8, and must be a
+        /// non-empty string free of control characters. Anything else is
+        /// reported rather than passed on, because a mangled password produces
+        /// an unactionable connection failure much later in startup.
         /// </summary>
-        public static bool RestrictToCurrentUser(string file)
+        /// <exception cref="CredentialException">
+        /// The stored value cannot be decoded into a usable secret.
+        /// </exception>
+        public static string DecodeSecretChecked(string stored)
         {
-            if (OperatingSystem.IsWindows())
+            string raw = (stored ?? string.Empty).Trim();
+            string decoded;
+            if (raw.StartsWith(ObfuscationPrefix, StringComparison.Ordinal))
             {
-                string user = (Environment.GetEnvironmentVariable("USERNAME") ?? string.Empty).Trim();
-                if (user.Length == 0)
+                string payload = raw.Substring(ObfuscationPrefix.Length);
+                if (!IsStrictBase64(payload, out byte[] bytes))
+                {
+                    throw new CredentialException("Invalid encoded credential", CredentialErrorCodes.InvalidSecretValue);
+                }
+                bytes = XorObfuscate(bytes, DeriveObfuscationKey());
+                if (!TryDecodeUtf8Strict(bytes, out decoded))
+                {
+                    throw new CredentialException("Invalid credential encoding", CredentialErrorCodes.InvalidSecretValue);
+                }
+            }
+            else
+            {
+                decoded = raw;
+            }
+            if (!IsUsableSecretValue(decoded))
+            {
+                throw new CredentialException("Invalid credential value", CredentialErrorCodes.InvalidSecretValue);
+            }
+            return decoded;
+        }
+
+        /// <summary>
+        /// True when <paramref name="value"/> is a non-empty string without
+        /// control characters.
+        ///
+        /// A control character cannot survive a process environment or a CLI
+        /// argument, so such a value can never be a working password.
+        /// </summary>
+        public static bool IsUsableSecretValue(string? value)
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+                return false;
+            }
+            foreach (char c in value)
+            {
+                if (c < 0x20 || (c >= 0x7f && c <= 0x9f))
                 {
                     return false;
                 }
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// True when <paramref name="value"/> is base64 that round-trips
+        /// unchanged.
+        ///
+        /// <see cref="Convert.FromBase64String(string)"/> throws on invalid
+        /// input, but it tolerates several non-canonical encodings, so the
+        /// round-trip comparison is what makes the check strict. A corrupted
+        /// payload would otherwise decode to a plausible-looking wrong secret.
+        /// </summary>
+        private static bool IsStrictBase64(string value, out byte[] bytes)
+        {
+            bytes = Array.Empty<byte>();
+            if (value.Length == 0)
+            {
+                return false;
+            }
+            foreach (char c in value.TrimEnd('='))
+            {
+                bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+                    || c == '+' || c == '/';
+                if (!ok)
+                {
+                    return false;
+                }
+            }
+            if (value.Length % 4 != 0)
+            {
+                return false;
+            }
+            try
+            {
+                bytes = Convert.FromBase64String(value);
+            }
+            catch (FormatException)
+            {
+                return false;
+            }
+            return Convert.ToBase64String(bytes) == value;
+        }
+
+        /// <summary>
+        /// Decodes UTF-8 without substituting replacement characters.
+        ///
+        /// <see cref="Encoding.UTF8"/> replaces invalid sequences with U+FFFD
+        /// unless it is told to throw, so a corrupted payload would otherwise
+        /// look like a valid secret that merely contains odd glyphs.
+        /// </summary>
+        private static bool TryDecodeUtf8Strict(byte[] bytes, out string decoded)
+        {
+            try
+            {
+                decoded = new UTF8Encoding(false, throwOnInvalidBytes: true).GetString(bytes);
+                return true;
+            }
+            catch (DecoderFallbackException)
+            {
+                decoded = string.Empty;
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Reports whether an <c>icacls</c> listing proves the file is readable
+        /// by exactly one non-inherited entry.
+        ///
+        /// An inherited entry means the parent directory's accounts keep their
+        /// access, which is exactly what the restriction exists to remove, and
+        /// no entry at all means the ACL could not be read.
+        /// </summary>
+        public static bool IsRestrictedAclListing(string? output)
+        {
+            if (output == null)
+            {
+                return false;
+            }
+            var aceLines = new List<string>();
+            foreach (string rawLine in output.Split('\n'))
+            {
+                string line = rawLine.Trim();
+                if (line.Length == 0
+                    || line.StartsWith("Successfully processed", StringComparison.Ordinal)
+                    || line.StartsWith("Failed processing", StringComparison.Ordinal)
+                    || line.StartsWith("The trust relationship", StringComparison.Ordinal)
+                    // A mandatory integrity label is not a DACL entry; it
+                    // appears when the process is elevated.
+                    || line.StartsWith("Mandatory Label", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+                aceLines.Add(line);
+            }
+            // `icacls` lists one ACE per line, so a restricted file has exactly one.
+            if (aceLines.Count != 1)
+            {
+                return false;
+            }
+            string ace = aceLines[0];
+            if (ace.Contains("(I)", StringComparison.Ordinal))
+            {
+                return false;
+            }
+            return ace.EndsWith("(F)", StringComparison.Ordinal);
+        }
+
+        /// <summary>
+        /// Reports whether a POSIX mode is owner-only.
+        ///
+        /// Only the group and other bits are considered, exactly as the Rust
+        /// <c>is_restricted_posix_mode</c> and the JavaScript
+        /// <c>isRestrictedPosixMode</c> do, so the three hosts agree on every
+        /// value the fixture carries.
+        /// </summary>
+        public static bool IsRestrictedPosixMode(int mode)
+        {
+            return (mode & 0x3F) == 0;
+        }
+
+        /// <summary>
+        /// Restricts a file to the current OS user and proves that it took
+        /// effect.
+        ///
+        /// Unlike a best-effort <c>chmod</c>, this re-reads the resulting ACL
+        /// and fails when the file is still readable by another principal. The
+        /// two files this protects hold the key that decrypts every stored
+        /// provider API key and the database password, so "we tried" is not an
+        /// acceptable answer.
+        /// </summary>
+        /// <exception cref="CredentialException">
+        /// The file could not be proven owner-only afterwards.
+        /// </exception>
+        public static void RestrictToCurrentUser(string file)
+        {
+            bool applied;
+            if (OperatingSystem.IsWindows())
+            {
+                string user = (Environment.GetEnvironmentVariable("USERNAME") ?? string.Empty).Trim();
+                applied = user.Length > 0 && TryGrantExclusiveAccess(file, user);
+            }
+            else
+            {
                 try
+                {
+                    File.SetUnixFileMode(file, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+                    applied = true;
+                }
+                catch
+                {
+                    applied = false;
+                }
+            }
+            if (!applied || !CheckRestrictedToCurrentUser(file))
+            {
+                throw new CredentialException(
+                    $"Could not restrict {Path.GetFileName(file)} to the current user",
+                    CredentialErrorCodes.PermissionsTooOpen,
+                    file);
+            }
+        }
+
+        private static bool TryGrantExclusiveAccess(string file, string user)
+        {
+            try
+            {
+                var startInfo = new ProcessStartInfo
+                {
+                    FileName = "icacls",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                };
+                startInfo.ArgumentList.Add(file);
+                startInfo.ArgumentList.Add("/inheritance:r");
+                startInfo.ArgumentList.Add("/grant:r");
+                startInfo.ArgumentList.Add($"{user}:F");
+                using var process = Process.Start(startInfo);
+                if (process == null)
+                {
+                    return false;
+                }
+                process.WaitForExit();
+                return process.ExitCode == 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Reports whether <paramref name="file"/> is currently readable only
+        /// by the current OS user.
+        ///
+        /// This is the enforced check: writers call it after restricting, and
+        /// readers call it before trusting an existing file, so a secrets file
+        /// left world readable by a previous release or by a manual copy is
+        /// caught on next start.
+        /// </summary>
+        public static bool CheckRestrictedToCurrentUser(string file)
+        {
+            try
+            {
+                if (OperatingSystem.IsWindows())
                 {
                     var startInfo = new ProcessStartInfo
                     {
@@ -357,32 +699,21 @@ namespace OfficeEquityOpenNotebook
                         RedirectStandardError = true,
                     };
                     startInfo.ArgumentList.Add(file);
-                    startInfo.ArgumentList.Add("/inheritance:r");
-                    startInfo.ArgumentList.Add("/grant:r");
-                    startInfo.ArgumentList.Add($"{user}:F");
                     using var process = Process.Start(startInfo);
                     if (process == null)
                     {
                         return false;
                     }
+                    string output = process.StandardOutput.ReadToEnd();
                     process.WaitForExit();
-                    return process.ExitCode == 0;
+                    if (process.ExitCode != 0)
+                    {
+                        return false;
+                    }
+                    return IsRestrictedAclListing(output);
                 }
-                catch
-                {
-                    return false;
-                }
-            }
-            try
-            {
-                if (!File.Exists(file))
-                {
-                    return false;
-                }
-                File.SetUnixFileMode(
-                    file,
-                    UnixFileMode.UserRead | UnixFileMode.UserWrite);
-                return true;
+                int mode = (int)File.GetUnixFileMode(file);
+                return IsRestrictedPosixMode(mode);
             }
             catch
             {
@@ -390,7 +721,12 @@ namespace OfficeEquityOpenNotebook
             }
         }
 
-        /// <summary>Writes contents to a file and restricts it to the current OS user.</summary>
+        /// <summary>
+        /// Writes contents to a file and enforces the owner-only restriction.
+        /// </summary>
+        /// <exception cref="CredentialException">
+        /// The file could not be proven owner-only afterwards.
+        /// </exception>
         private static void WriteSecretFile(string file, string contents)
         {
             string? directory = Path.GetDirectoryName(file);
@@ -403,29 +739,114 @@ namespace OfficeEquityOpenNotebook
         }
 
         /// <summary>
+        /// Reads a secrets file, enforcing that it is owner-only.
+        ///
+        /// The permission check happens before the contents are used so a
+        /// secret that another account may already have read is never treated
+        /// as trustworthy.
+        /// </summary>
+        /// <returns>The contents, or null when the file is absent.</returns>
+        private static string? ReadProtectedSecretFile(string file)
+        {
+            string contents;
+            try
+            {
+                contents = File.ReadAllText(file, Utf8NoBom);
+            }
+            catch (FileNotFoundException)
+            {
+                return null;
+            }
+            catch (DirectoryNotFoundException)
+            {
+                return null;
+            }
+            catch (IOException)
+            {
+                throw new CredentialException(
+                    "Could not read credential file",
+                    CredentialErrorCodes.InvalidSecretsFile,
+                    file);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                throw new CredentialException(
+                    "Could not read credential file",
+                    CredentialErrorCodes.InvalidSecretsFile,
+                    file);
+            }
+            if (!CheckRestrictedToCurrentUser(file))
+            {
+                throw new CredentialException(
+                    $"{Path.GetFileName(file)} is readable by accounts other than the current user",
+                    CredentialErrorCodes.PermissionsTooOpen,
+                    file);
+            }
+            return contents;
+        }
+
+        /// <summary>
         /// True when dataDir already holds a SurrealDB datastore from an
         /// earlier run.
         ///
         /// RocksDB stores its datastore in a directory, which reports a size of
         /// 0 on Windows, so both shapes have to be checked.
+        ///
+        /// The answer decides whether a missing secrets file is a fresh install
+        /// or a legacy one, so an inspection error is reported rather than read
+        /// as "no datastore": guessing there would overwrite a live
+        /// installation's password.
         /// </summary>
+        /// <exception cref="CredentialException">
+        /// The datastore path exists but cannot be inspected.
+        /// </exception>
         public static bool HasExistingDatastore(string dataDir)
         {
-            string file = Path.Combine(dataDir, DatabaseDirname, DatabaseFilename);
-            try
+            string dbDir = Path.Combine(dataDir, DatabaseDirname);
+            string file = Path.Combine(dbDir, DatabaseFilename);
+            // A datastore path occupied by something other than a directory
+            // cannot be inspected. Windows reports this shape as "not found"
+            // all the way down, which would otherwise be indistinguishable from
+            // a fresh install.
+            if (File.Exists(dbDir))
             {
-                if (Directory.Exists(file))
+                throw new CredentialException("Could not inspect datastore", CredentialErrorCodes.DatastoreUnreadable, dbDir);
+            }
+            if (Directory.Exists(file))
+            {
+                try
                 {
                     return Directory.EnumerateFileSystemEntries(file).Any();
                 }
-                if (File.Exists(file))
+                catch (Exception error) when (error is IOException || error is UnauthorizedAccessException)
+                {
+                    throw new CredentialException("Could not inspect datastore", CredentialErrorCodes.DatastoreUnreadable, file);
+                }
+            }
+            if (File.Exists(file))
+            {
+                try
                 {
                     return new FileInfo(file).Length > 0;
                 }
+                catch (Exception error) when (error is IOException || error is UnauthorizedAccessException)
+                {
+                    throw new CredentialException("Could not inspect datastore", CredentialErrorCodes.DatastoreUnreadable, file);
+                }
             }
-            catch
+            // The file is absent. The directory itself still has to be
+            // inspectable: a directory that exists but cannot be listed hides a
+            // legacy datastore just as effectively as an unreadable file does.
+            if (Directory.Exists(dbDir))
             {
-                return false;
+                try
+                {
+                    Directory.EnumerateFileSystemEntries(dbDir).Any();
+                }
+                catch (Exception error) when (error is IOException || error is UnauthorizedAccessException)
+                {
+                    throw new CredentialException("Could not inspect datastore", CredentialErrorCodes.DatastoreUnreadable, dbDir);
+                }
             }
             return false;
         }
@@ -433,33 +854,54 @@ namespace OfficeEquityOpenNotebook
         /// <summary>
         /// Returns the persisted database password for dataDir, generating one
         /// on first use.
+        ///
+        /// A secrets file that cannot be parsed or decoded is reported and left
+        /// untouched: it may still hold the only copy of the password the
+        /// datastore accepts, and rewriting it would turn a recoverable problem
+        /// into a lockout. The legacy-unmigrated case is signalled by
+        /// <see cref="ResolveDatabaseCredentials"/>, not here.
         /// </summary>
+        /// <exception cref="CredentialException">
+        /// The stored credential cannot be trusted or no password can be
+        /// generated.
+        /// </exception>
         public static string EnsureDatabasePassword(string dataDir)
         {
             string secretsFile = Path.Combine(dataDir, SecretsFilename);
-            if (File.Exists(secretsFile))
+            string? contents = ReadProtectedSecretFile(secretsFile);
+            if (contents != null)
             {
+                string stored;
                 try
                 {
-                    string contents = File.ReadAllText(secretsFile, Encoding.UTF8);
-                    using JsonDocument document = JsonDocument.Parse(contents);                    if (document.RootElement.TryGetProperty("surrealPassword", out JsonElement stored)
-                        && stored.ValueKind == JsonValueKind.String
-                        && stored.GetString() is { Length: > 0 } value)
+                    using JsonDocument document = JsonDocument.Parse(contents);
+                    if (!document.RootElement.TryGetProperty("surrealPassword", out JsonElement value)
+                        || value.ValueKind != JsonValueKind.String
+                        || value.GetString() is not { Length: > 0 } parsed)
                     {
-                        return DecodeSecret(value);
+                        throw new CredentialException(
+                            "Invalid database credential file",
+                            CredentialErrorCodes.InvalidSecretsFile,
+                            secretsFile);
                     }
+                    stored = parsed;
                 }
                 catch (JsonException)
                 {
-                    // A corrupt secrets file is rewritten below rather than
-                    // crashing startup.
+                    throw new CredentialException(
+                        "Invalid database credential file",
+                        CredentialErrorCodes.InvalidSecretsFile,
+                        secretsFile);
                 }
-                catch (IOException)
-                {
-                    // Same as above: a corrupt or unreadable file is replaced.
-                }
+                return DecodeSecretChecked(stored);
             }
-
+            if (HasExistingDatastore(dataDir))
+            {
+                throw new CredentialException(
+                    "Existing datastore has no credential file; recovery is required",
+                    CredentialErrorCodes.InvalidSecretsFile,
+                    secretsFile);
+            }
             string password = RandomPassword();
             var payload = new Dictionary<string, string>
             {
@@ -469,7 +911,13 @@ namespace OfficeEquityOpenNotebook
             return password;
         }
 
-        /// <summary>Generates a random base64url password.</summary>
+        /// <summary>
+        /// Generates a random base64url password.
+        ///
+        /// A random-source failure stops startup rather than falling back to a
+        /// deterministic value, because a placeholder would be a publicly known
+        /// password on a loopback service.
+        /// </summary>
         private static string RandomPassword()
         {
             byte[] buffer = RandomNumberGenerator.GetBytes(DatabasePasswordBytes);
@@ -482,26 +930,36 @@ namespace OfficeEquityOpenNotebook
         /// <summary>
         /// Resolves the SurrealDB credentials to start the database with.
         ///
-        /// SurrealDB applies the initial root credentials only when no root
-        /// user exists yet, so a freshly generated password has no effect on a
-        /// datastore created by an older build: the stored root credentials win
-        /// and the backend would be locked out of its own data. Existing
-        /// datastores therefore keep their original password so upgrades never
-        /// lose notebook content; only new installs get a random one.
+        /// SurrealDB applies the initial root credentials only when no root user
+        /// exists yet, so a freshly generated password has no effect on a
+        /// datastore created by an older build. Every host therefore reports one
+        /// of three states:
+        ///
+        ///   - <see cref="CredentialSource.Generated"/> — fresh install,
+        ///     random password created.
+        ///   - <see cref="CredentialSource.Stored"/> — password read back from
+        ///     <c>secrets.json</c>.
+        ///   - <see cref="CredentialSource.LegacyUnmigrated"/> — datastore
+        ///     exists, no secrets file. The install predates per-install
+        ///     credentials and needs an explicit migration; no password is
+        ///     returned.
         /// </summary>
+        /// <exception cref="CredentialException">
+        /// The credential state cannot be established safely.
+        /// </exception>
         public static DatabaseCredentials ResolveDatabaseCredentials(string dataDir)
         {
             string secretsFile = Path.Combine(dataDir, SecretsFilename);
             bool hadSecrets = File.Exists(secretsFile);
 
-            if (HasExistingDatastore(dataDir) && !hadSecrets)
+            if (!hadSecrets && HasExistingDatastore(dataDir))
             {
                 return new DatabaseCredentials
                 {
                     User = DatabaseUser,
-                    Password = LegacyDatabasePassword,
+                    Password = null,
                     Legacy = true,
-                    Source = CredentialSource.Legacy,
+                    Source = CredentialSource.LegacyUnmigrated,
                 };
             }
 
@@ -516,28 +974,57 @@ namespace OfficeEquityOpenNotebook
         }
 
         /// <summary>
-        /// Returns the persisted encryption key for dataDir, generating a
-        /// random 32-byte key on first use.
+        /// Returns the persisted encryption key for dataDir, generating a random
+        /// 32-byte key on first use.
         ///
         /// The key is stored obfuscated so it never appears in plaintext on
-        /// disk. Legacy plaintext key files are still readable, but new keys
-        /// use the obfuscated format.
+        /// disk. Legacy plaintext key files are still readable, but any stored
+        /// key must have the documented shape: decrypting every saved provider
+        /// API key with a truncated or non-hex value would fail long after
+        /// startup reported success.
         /// </summary>
+        /// <exception cref="CredentialException">
+        /// The stored key is unusable or no key can be generated.
+        /// </exception>
         public static string EnsureEncryptionKey(string dataDir)
         {
             string keyFile = Path.Combine(dataDir, KeyFilename);
-            if (File.Exists(keyFile))
+            string? contents = ReadProtectedSecretFile(keyFile);
+            if (contents != null)
             {
-                string existing = DecodeSecret(File.ReadAllText(keyFile, Encoding.UTF8));
-                if (existing.Length > 0)
+                string existing = DecodeSecretChecked(contents);
+                if (existing.Length != EncryptionKeyBytes * 2 || !IsLowerHex(existing))
                 {
-                    return existing;
+                    throw new CredentialException(
+                        "Invalid encryption key",
+                        CredentialErrorCodes.InvalidSecretValue,
+                        keyFile);
                 }
+                return existing;
             }
-
+            if (HasExistingDatastore(dataDir))
+            {
+                throw new CredentialException(
+                    "Existing datastore has no encryption key; recovery is required",
+                    CredentialErrorCodes.InvalidSecretsFile,
+                    keyFile);
+            }
             string key = Convert.ToHexString(RandomNumberGenerator.GetBytes(EncryptionKeyBytes)).ToLowerInvariant();
             WriteSecretFile(keyFile, EncodeSecret(key));
             return key;
+        }
+
+        private static bool IsLowerHex(string value)
+        {
+            foreach (char c in value)
+            {
+                bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+                if (!ok)
+                {
+                    return false;
+                }
+            }
+            return value.Length > 0;
         }
 
         /// <summary>
@@ -550,14 +1037,33 @@ namespace OfficeEquityOpenNotebook
         ///
         /// The credentials are passed through the process environment rather
         /// than the command line so they never appear in the process listing.
+        ///
+        /// A missing password is an error, not a default. Substituting the
+        /// legacy root password here is what previously made the legacy case
+        /// invisible.
         /// </summary>
+        /// <exception cref="CredentialException">
+        /// No usable password is available, which means the credential
+        /// migration has not run.
+        /// </exception>
         public static CredentialEnvironment BuildCredentialEnvironment(DatabaseCredentials credentials)
         {
+            if (credentials == null)
+            {
+                throw new ArgumentNullException(nameof(credentials));
+            }
+            if (!IsUsableSecretValue(credentials.Password))
+            {
+                throw new CredentialException(
+                    "No database password available; credential migration is required",
+                    CredentialErrorCodes.InvalidSecretValue);
+            }
+            string user = credentials.User.Length > 0 ? credentials.User : DatabaseUser;
             return new CredentialEnvironment
             {
-                SurrealUser = credentials.User,
-                SurrealPassword = credentials.Password,
-                SurrealPass = credentials.Password,
+                SurrealUser = user,
+                SurrealPassword = credentials.Password!,
+                SurrealPass = credentials.Password!,
             };
         }
     }
