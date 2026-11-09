@@ -19,6 +19,7 @@ console.log('Testing No-Docling Core Runtime Contracts (L1.2)...\n');
 console.log('--- Suite 1: Feature Flag Configuration ---');
 {
   const fullEnv = createBackendEnvironment({
+    credentials: { user: 'root', password: 'synthetic-test-password' },
     backendPath: '/test/backend',
     dataFolder: '/test/data',
     encryptionKey: 'test-key',
@@ -30,6 +31,7 @@ console.log('--- Suite 1: Feature Flag Configuration ---');
   console.log('  -> Explicitly enabled flag verified');
 
   const coreEnv = createBackendEnvironment({
+    credentials: { user: 'root', password: 'synthetic-test-password' },
     backendPath: '/test/backend',
     dataFolder: '/test/data',
     encryptionKey: 'test-key',
@@ -41,6 +43,7 @@ console.log('--- Suite 1: Feature Flag Configuration ---');
   console.log('  -> Explicitly disabled flag verified');
 
   const stringEnv = createBackendEnvironment({
+    credentials: { user: 'root', password: 'synthetic-test-password' },
     backendPath: '/test/backend',
     dataFolder: '/test/data',
     encryptionKey: 'test-key',
@@ -74,6 +77,7 @@ console.log('\n--- Suite 2: Core Workflows Operational Without Docling ---');
   }
 
   const coreEnv = createBackendEnvironment({
+    credentials: { user: 'root', password: 'synthetic-test-password' },
     backendPath: '/test/backend',
     dataFolder: '/test/data',
     encryptionKey: 'test-key',

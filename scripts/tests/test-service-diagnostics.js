@@ -87,8 +87,10 @@ async function electronErrors(mode) {
       return {stop:async()=>{throw Error('SYNTHETIC_EXCEPTION');}};
     }},
     './scripts/lib/credentials':{
+      credentialStartupMessage: require('../lib/credentials').credentialStartupMessage,
       ensureEncryptionKey:()=>{
         if(mode==='key-error')throw Error('SYNTHETIC_EXCEPTION');
+        if(mode==='key-recovery'){const error=Error('SYNTHETIC_EXCEPTION');error.code=require('../lib/credentials').CREDENTIAL_ERROR_INVALID_SECRETS_FILE;throw error;}
         return 'synthetic key';
       },
       resolveDatabaseCredentials:()=>({user:'root',password:'synthetic',legacy:false,source:'stored'}),
@@ -105,6 +107,7 @@ async function electronErrors(mode) {
   assert.ok(messages.length>0);
   noSensitiveContent(messages.map(String).join('\n'));
   if(mode==='shutdown')assert.ok(messages.includes('SERVICE_SHUTDOWN_FAILED'));
+  if(mode==='key-recovery')assert.ok(messages.some(value=>String(value).includes('Restore the credentials file from a backup')));
 }
 function nativeChildren() {
   const executable=path.join(temporary,process.platform==='win32'?'native-diagnostics.exe':'native-diagnostics');
@@ -120,7 +123,7 @@ function nativeChildren() {
 (async()=>{
   javascriptChildren();
   cliErrors();
-  for(const mode of ['missing','startup','shutdown','key-error'])await electronErrors(mode);
+  for(const mode of ['missing','startup','shutdown','key-error','key-recovery'])await electronErrors(mode);
   nativeChildren();
   console.log('Diagnostics: real JS/Rust child output, exceptions, failures, and launcher errors contain only safe lifecycle metadata.');
 })().catch(error=>{console.error(error);process.exitCode=1;}).finally(()=>fs.rmSync(temporary,{recursive:true,force:true}));

@@ -11,7 +11,7 @@
 
 const path = require('path');
 const { startServices } = require('./start-services');
-const { ensureEncryptionKey } = require('./lib/credentials');
+const { ensureEncryptionKey, credentialStartupMessage } = require('./lib/credentials');
 
 function arg(name, def) {
   const i = process.argv.indexOf(name);
@@ -41,7 +41,8 @@ async function main() {
   process.on('SIGTERM', stop);
 }
 
-main().catch(() => {
+main().catch((error) => {
   console.error('SERVICE_STARTUP_FAILED');
+  console.error(credentialStartupMessage(error));
   process.exit(1);
 });
