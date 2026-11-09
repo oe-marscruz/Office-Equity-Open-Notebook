@@ -156,24 +156,55 @@ function cp(src, dest, opts = {}) {
   fs.cpSync(src, dest, { recursive: true, dereference: true, ...opts });
 }
 
+/**
+ * Reads the provenance manifest emitted by the frontend build so the runtime
+ * manifest reports what was actually assembled rather than a constant.
+ */
+function readFrontendProvenance() {
+  const manifestPath = path.join(RUNTIME_DIR, 'frontend', 'static', 'build-manifest.json');
+  if (!fs.existsSync(manifestPath)) {
+    return null;
+  }
+  try {
+    const frontendManifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    return {
+      frontendKind: frontendManifest.frontendKind,
+      buildTarget: frontendManifest.buildTarget,
+      isProofOfConcept: frontendManifest.isProofOfConcept,
+      upstreamCommit: frontendManifest.provenance && frontendManifest.provenance.upstreamCommit,
+      fileCount: frontendManifest.export && frontendManifest.export.fileCount,
+    };
+  } catch (err) {
+    console.warn(`Warning: could not read frontend build manifest: ${err.message}`);
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Steps
 // ---------------------------------------------------------------------------
 
 function buildFrontend(repo) {
-  log('frontend', 'Assembling Node-free static frontend assets');
+  // Builds the pinned upstream Next.js UI into a Node-free static export. The
+  // native host serves these assets and proxies /api/* to the bundled FastAPI
+  // backend, so no Node runtime is required at runtime (X20).
+  log('frontend', 'Building the Open Notebook UI as a Node-free static export');
+
   const destStatic = path.join(RUNTIME_DIR, 'frontend', 'static');
   rmrf(path.join(RUNTIME_DIR, 'frontend'));
-  fs.mkdirSync(destStatic, { recursive: true });
 
-  const { buildStaticClientPoc } = require('./build-static-client');
-  buildStaticClientPoc();
-
-  const pocDir = path.join(PROJECT_DIR, '.artifacts', 'static-client-poc');
-  if (fs.existsSync(pocDir)) {
-    cp(pocDir, destStatic);
+  const { main: buildFrontendStatic } = require('./build-frontend-static');
+  const previousRepoArg = process.argv;
+  try {
+    // build-frontend-static reads --repo/--output from argv; pass them through
+    // explicitly so `prepare:runtime --step frontend --repo=<path>` stays coherent.
+    process.argv = [previousRepoArg[0], previousRepoArg[1], `--repo=${repo}`, `--output=${destStatic}`];
+    buildFrontendStatic();
+  } finally {
+    process.argv = previousRepoArg;
   }
-  log('frontend', 'Assembled Node-free static frontend assets');
+
+  log('frontend', 'Node-free static frontend assets ready');
 }
 
 function buildPython(repo, options = {}) {
@@ -449,6 +480,7 @@ async function main() {
     targetArchitecture: os.arch(),
     variant,
     allowlistPassed,
+    frontend: readFrontendProvenance(),
     toolchains: {
       surreal: SURREAL_VERSION,
       python: '3.12',
