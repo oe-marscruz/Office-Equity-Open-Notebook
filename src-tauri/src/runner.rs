@@ -71,7 +71,10 @@ pub async fn start_services(runtime_path: PathBuf) -> Result<(), String> {
         }
     }
 
-    let data_dir = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(".")).join("OfficeEquityOpenNotebook");
+    let default_data_dir = dirs::data_local_dir()
+        .ok_or("APPLICATION_DATA_DIRECTORY_UNAVAILABLE")?
+        .join("OfficeEquityOpenNotebook");
+    let data_dir = crate::runtime_paths::resolve_data_dir(default_data_dir, env::var_os("OEON_DATA_DIR"))?;
     fs::create_dir_all(&data_dir).map_err(|_| "Could not create application data directory")?;
 
     // Resolve the per-install database credentials and the provider-API-key
@@ -87,6 +90,9 @@ pub async fn start_services(runtime_path: PathBuf) -> Result<(), String> {
     fs::create_dir_all(&logs_dir).unwrap_or_default();
 
     let backend_path = runtime_path.join("backend");
+    let data_folder = data_dir.join("data");
+    fs::create_dir_all(&data_folder).map_err(|_| "APPLICATION_DATA_DIRECTORY_FAILED")?;
+    let tiktoken_cache = runtime_path.join("tiktoken-cache");
 
     // 1. SurrealDB
     let surreal_db_file = data_dir.join("surrealdb").join("mydatabase.db");
@@ -110,6 +116,9 @@ pub async fn start_services(runtime_path: PathBuf) -> Result<(), String> {
         api_cmd.env(name, value);
     }
     api_cmd.env("OPEN_NOTEBOOK_ENCRYPTION_KEY", &encryption_key);
+    api_cmd.env("DATA_FOLDER", &data_folder);
+    api_cmd.env("TIKTOKEN_CACHE_DIR", &tiktoken_cache);
+    api_cmd.env("PYTHONUTF8", "1");
     api_cmd.env("SURREAL_URL", "ws://127.0.0.1:8000/rpc");
     api_cmd.env("SURREAL_NAMESPACE", "open_notebook");
     api_cmd.env("SURREAL_DATABASE", "open_notebook");
@@ -125,6 +134,9 @@ pub async fn start_services(runtime_path: PathBuf) -> Result<(), String> {
         worker_cmd.env(name, value);
     }
     worker_cmd.env("OPEN_NOTEBOOK_ENCRYPTION_KEY", &encryption_key);
+    worker_cmd.env("DATA_FOLDER", &data_folder);
+    worker_cmd.env("TIKTOKEN_CACHE_DIR", &tiktoken_cache);
+    worker_cmd.env("PYTHONUTF8", "1");
     worker_cmd.env("SURREAL_URL", "ws://127.0.0.1:8000/rpc");
     worker_cmd.env("SURREAL_NAMESPACE", "open_notebook");
     worker_cmd.env("SURREAL_DATABASE", "open_notebook");

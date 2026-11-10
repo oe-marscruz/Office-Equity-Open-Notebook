@@ -4,6 +4,7 @@
 )]
 
 mod runner;
+mod runtime_paths;
 mod service_diagnostics;
 mod security;
 mod job_object;

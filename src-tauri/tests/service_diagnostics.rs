@@ -1,3 +1,5 @@
+#[path = "../src/runtime_paths.rs"]
+mod runtime_paths;
 #[path = "../src/service_diagnostics.rs"]
 mod service_diagnostics;
 

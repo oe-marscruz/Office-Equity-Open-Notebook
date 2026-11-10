@@ -19,7 +19,7 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 
 const PROJECT_DIR = path.join(__dirname, '..');
-const RUNTIME_DIR = path.join(PROJECT_DIR, 'resources', 'runtime');
+const RUNTIME_DIR = path.resolve(arg('--runtime', path.join(PROJECT_DIR, 'resources', 'runtime')));
 const ELECTRON_DIST = path.join(PROJECT_DIR, 'node_modules', 'electron', 'dist');
 const PRODUCT_NAME = 'Office of Equity Open Notebook';
 const VERSION = '1.14.0';
