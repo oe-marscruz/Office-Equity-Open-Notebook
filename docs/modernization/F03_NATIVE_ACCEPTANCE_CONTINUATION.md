@@ -1,66 +1,118 @@
-# F03 native acceptance continuation — 2026-11-10
+# F03 native diagnostics acceptance - 2026-11-10
 
-Continuation of [the diagnostics handoff](../compliance/ferpa/SERVICE_DIAGNOSTICS_HANDOFF.md).
-Branch: `codex/f03-native-acceptance`. Starting commit: `3e4caf6`.
-The user requested a save point before application launch or installation.
+Continuation of [the original diagnostics handoff](../compliance/ferpa/SERVICE_DIAGNOSTICS_HANDOFF.md).
+Branch: `codex/f03-native-acceptance`. Saved data-isolation commit: `7b91dd1`.
+Packaging/startup fixes and regression tests: `3de2fbd`.
 
-## Saved source changes
+## Current result
 
-- `src-tauri/src/runtime_paths.rs` validates an optional absolute `OEON_DATA_DIR` override. Empty and relative overrides fail closed; the default application directory is preserved when absent.
-- Native startup supplies `DATA_FOLDER=<selected-directory>/data`, `TIKTOKEN_CACHE_DIR=<runtime>/tiktoken-cache`, and `PYTHONUTF8=1` to both API and worker. Previously backend-owned uploads and SQLite could be written relative to the bundled backend directory.
-- Native diagnostics integration tests include the production path resolver and three new cases (default, explicit absolute directory, invalid overrides).
-- `scripts/package-native.js --runtime <directory>` selects an isolated runtime for packaging; the existing default remains available.
+The real unpacked release and the actual installed Windows application both passed synthetic notebook creation, restart persistence, forced API/worker failure, and blocked-diagnostic-path checks. The installer completed with exit code 0; the installed executable and all 23,876 runtime files matched the tested package. The isolated test installation was subsequently removed. Existing 1.14.1 installation metadata and original shortcuts were restored, and its executable hash was unchanged. This closes the specific installed-application checks exercised here; it does not close every F03 diagnostic boundary.
 
-## Verified results
+F03 remains open for the untested acceptance boundaries listed below. No GitHub publication or Azure deployment occurred.
 
-- `npm.cmd run build:types`: PASS after each edited source file.
-- `node scripts/orchestrator/verifier.js`: PASS, 30/30 suites.
-- Full offline Cargo test run: PASS, 49 tests (33 application tests, 1 contract harness, 3 proxy/static tests, 6 diagnostics/path tests, 6 static-route tests).
-- Actual pinned frontend static build: PASS, 200 files / 6.6 MiB; Next.js build output reported 16.3.8. Upstream revision matched `a0f6f3081ae06328f0a451b3a3ef2959ca25721d`.
-- Backend assembly and tiktoken offline cache: PASS in the isolated output.
-- Actual release native package: PASS. Cargo release compilation completed in 10m47s, followed by runtime copying. The linker warned about multiple non-default manifests; graphical/runtime impact remains unverified. rcedit was unavailable, so executable metadata was not rewritten.
+## Corrections proved through application runs
 
-Generated artifacts are ignored local files under `resources/.cache/f03-acceptance/`:
+1. The initial package exited with `0xC0000135`. PE import inspection identified `WebView2Loader.dll`, emitted in the Rust release directory but omitted by the packager. A new packaging regression test reproduced the missing file before the fix. The packager now includes the loader when emitted; the test also supports builds that link it statically.
+2. After adding the DLL, the application exited before API readiness. The native window used an embedded URL although its navigation policy allows the local HTTP origin. Startup also created the window before its services were ready. Startup now waits for service initialization, then opens `http://127.0.0.1:8502/`. The corrected release completed the real application tests.
+3. Native data isolation from the previous save point remains in place: absolute `OEON_DATA_DIR`, backend `DATA_FOLDER`, bundled token-cache path, and UTF-8 Python mode. API and worker data did not appear under the packaged backend resources.
+4. The installer builder accepts `--app` and `--out` so acceptance artifacts do not replace the default package. Windows CI now includes the window-origin tests; that workflow change has not been executed on GitHub here.
 
-- `runtime/`: assembled core runtime, with real frontend and pinned backend.
-- `package/Office of Equity Open Notebook/Office of Equity Open Notebook.exe`: unpacked release executable.
-- Executable SHA-256: `14108451FFEBAAC5845C3F5ECE782F45CE579ADA5392887996B1DA3C80396BD4`.
-- `inventory.js`: retained full-runtime hashing and Python import/version inventory script. It was interrupted at the requested save point; no completed inventory result is claimed. Rerun with `node resources/.cache/f03-acceptance/inventory.js`.
+## Observed verification
 
-Python and SurrealDB were copied from the existing AndroidStudioProjects checkout's `resources/.cache/f05-stage/runtime/`; no source-code or acceptance claims were transferred from that checkout. This runtime contains 184 Python distribution metadata directories. Docling was absent, so the assembled and packaged runtime manifests were corrected to `variant: core`. SurrealDB's SHA-256 independently matched the assembler's pinned checksum:
-`DD9B6FA15EDACBDE96D490DD5727B49B5CF40DF80F29074C7DC17ACB974F509F`.
-Python dependencies have not been freshly resolved against a reviewed immutable lock in this continuation. The manifest's `wrapperCommit` is the pre-edit baseline, not evidence that the package was built from a clean committed tree. The release executable was compiled with the saved working-tree source changes.
+| Check | Result |
+| --- | --- |
+| `npm.cmd run build:types` after each authored file edit | PASS |
+| `node scripts/orchestrator/verifier.js` | PASS, 31/31 suites |
+| Full offline Cargo tests through short target path | PASS, 50 tests |
+| Release native build | PASS |
+| Runtime Python imports/version inventory | PASS, Python 3.12.14, 184 distributions |
+| Real static frontend | PASS, 200 files; build reported Next.js 16.3.8 |
+| Packaged runtime vs recorded inventory | PASS, 23,876 files, zero missing/changed/extra files |
+| Packaged startup + frontend HTTP | PASS |
+| Synthetic notebook create + application restart persistence | PASS |
+| Forced worker/API process exits | PASS, each recorded numeric exit code 1 |
+| Host 502 after API termination with query/token canaries | PASS, fixed `UPSTREAM_CONNECTION_FAILED`, no query disclosure |
+| API and worker diagnostic destinations blocked by directories at JSONL file paths | PASS, fixed startup-failure message observed and affected service not spawned |
+| Inspected host lifecycle files and parent output | PASS, expected schema, no synthetic record/token/path canaries |
+| Actual NSIS installer compilation | PASS |
+| Actual installed application smoke/failure checks | PASS, repeated through the installed executable |
+| Installed runtime hash comparison | PASS, 23,876 files, no missing/changed/extra files |
+| Test uninstall and prior-installation restoration | PASS; registry preflight limitation described below |
 
-The existing `resources/runtime/` and `upstream.lock.json` were not modified. Test-generated changes to tracked `.artifacts/` files were restored to the initially clean baseline before saving.
+The blocked-path cases test a directory where a diagnostic file should be. They do not establish behavior under every Windows ACL-denial condition. The frontend test exercised its actual HTTP assets and API workflow; visual interaction in the native WebView was not inspected.
 
-## Reproducible native toolchain workaround
+The full native run covered 34 application tests, 1 contract harness, 3 proxy/static tests, 6 service-diagnostics/path tests, and 6 static-route tests. The repository packaging regression executes the real packager with controlled build dependencies; the subsequent real executable launches separately establish runtime evidence.
 
-The rustup-shim Cargo invocation stalled. Direct Cargo revealed that GNU windres failed on the space in `Codex Projects`. A short-path junction points at the existing target cache:
+## Artifacts and provenance
+
+All generated artifacts below are ignored local files under `resources/.cache/f03-acceptance/` and are not included in Git commits:
+
+- `runtime/`: assembled core runtime.
+- `runtime-inventory.json`: versions and SHA-256 for 23,876 files, totaling 691,889,095 bytes.
+- `package/Office of Equity Open Notebook/`: tested unpacked release.
+- `package-runtime-verification.json`: comparison against that complete inventory.
+- `application-smoke-result.json`: successful create/restart/canary checks.
+- `application-failures-result.json`: strengthened failure checks requiring the fixed startup-failure message for each blocked destination.
+- `application-smoke-missing-loader.json` and `application-smoke-before-startup-fix.json`: initial reproduced failures.
+- `verifier-latest.txt`: complete final repository-verifier output.
+- `installer/Office of Equity Open Notebook-1.14.0-Setup.exe`: actual Windows installer, 251,608,281 bytes.
+- `install-attempt.json`: successful installation, exact isolated target, executable hash, and shortcut backups.
+- `installed-application-smoke-result.json` and `installed-application-failures-result.json`: successful tests of the actual installed executable.
+- `installed-runtime-verification.json`: complete installed payload hash comparison.
+- `uninstall-result.json`: successful cleanup and previous-installation restoration checks.
+- `data-sink-inspection.json`: 139 synthetic-data files inventoried, including 25 host diagnostic files and 11 datastore .log files. Host diagnostics had no canaries. Datastore .log files are product storage and are not characterized as sanitized diagnostics.
+
+SHA-256:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| Tested release executable | `73D353831C4980A3A91256CF0E4AA7F06D2B88C92CAA6D435B59AF33EAD11CC4` |
+| WebView2Loader.dll | `38F04671D2BD3FD580AEAE4CFBE6FEDBB79970D754869FC2907759846030CD44` |
+| Windows installer | `8DD256C2E9AD3F7D1F05F2374478E68133FF30A100415A136607D439AD8A9E61` |
+| SurrealDB 2.6.5 | `DD9B6FA15EDACBDE96D490DD5727B49B5CF40DF80F29074C7DC17ACB974F509F` |
+
+Backend and frontend were rebuilt from upstream `a0f6f3081ae06328f0a451b3a3ef2959ca25721d`. Python and SurrealDB came from the existing AndroidStudioProjects checkout's `resources/.cache/f05-stage/runtime/`. Their actual copied contents were inventoried and compared with the packaged payload; no prior acceptance claims were transferred from that checkout. Python dependencies were not freshly resolved against a reviewed immutable lock in this continuation. Docling is absent and the runtime is explicitly `core`.
+
+Runtime manifests retain their original assembly baseline `3e4caf6`; that field is not evidence of a clean-tree build of the subsequently corrected native host. The source changes were saved as `3de2fbd` after the native build and tests. The installer labels itself 1.14.0, while Tauri configuration declares 1.0.0; retain the hashes above as the precise artifact identity. The existing resource-manifest/linker warning and unavailable rcedit remain recorded build limitations.
+
+The original `resources/runtime/` and `upstream.lock.json` were not replaced. Application tests used new synthetic-only directories under the ignored acceptance folder and stopped their own processes. Generated changes to tracked `.artifacts/` files were restored before the source commit.
+
+## Commands and toolchain
+
+The rustup Cargo shim stalled in this environment. Direct GNU Cargo initially exposed a windres failure on spaces in `Codex Projects`. A short-path junction reuses the existing build cache:
 
 `C:/Users/cruzmars/.cache/oeon-f03-target` -> this checkout's `src-tauri/target`.
-
-Use the explicit installed compiler and Cargo, with the short target directory:
 
 ```powershell
 $env:PATH = 'C:\Users\cruzmars\.rustup\toolchains\stable-x86_64-pc-windows-gnu\bin;' + $env:PATH
 $env:RUSTC = 'C:\Users\cruzmars\.rustup\toolchains\stable-x86_64-pc-windows-gnu\bin\rustc.exe'
 & 'C:\Users\cruzmars\.rustup\toolchains\stable-x86_64-pc-windows-gnu\bin\cargo.exe' test --offline --manifest-path src-tauri/Cargo.toml --target-dir 'C:\Users\cruzmars\.cache\oeon-f03-target'
-```
-
-For packaging with that existing junction:
-
-```powershell
 $env:CARGO_TARGET_DIR = 'C:\Users\cruzmars\.cache\oeon-f03-target'
 $env:CARGO_NET_OFFLINE = 'true'
 node scripts/package-native.js --runtime resources/.cache/f03-acceptance/runtime --out resources/.cache/f03-acceptance/package
+node resources/.cache/f03-acceptance/application-smoke.js
+node resources/.cache/f03-acceptance/application-failures.js
+node resources/.cache/f03-acceptance/verify-package-runtime.js
+node scripts/build-installer-native.js --app 'resources/.cache/f03-acceptance/package/Office of Equity Open Notebook' --out resources/.cache/f03-acceptance/installer --makensis 'C:\Program Files (x86)\NSIS\makensis.exe'
 ```
 
-## Next acceptance work — still open
+## Remaining boundary
 
-1. Complete the runtime inventory and confirm dependency provenance/imports. Keep the core variant explicit; full/Docling behavior is untested.
-2. Launch the saved release executable with `OEON_DATA_DIR` set to a new absolute test directory. Check that ports 8000, 5055, and 8502 are unused first. No application was launched in this continuation; no personal application data was accessed.
-3. Exercise synthetic notebook workflows, API and worker failures, nonzero exits, restart, and missing/unwritable diagnostics destinations through the packaged application. Inspect both host lifecycle diagnostics and backend/dependency-owned file sinks; verify backend data stays outside bundled resources.
-4. Build/install the real Windows installer and repeat acceptance in the installed application. The saved package is an unpacked release, not installer acceptance.
-5. Record application/runtime hashes, exact actions, inspected sinks, canaries, and results. Keep OS crash sinks, exports, cloud diagnostics, and untested UI behavior explicitly unverified.
+Installed workflow, failure checks, payload verification, and test cleanup are complete for the cases above. OS-managed crash reporting, true ACL-denial cases, every backend error response/export, full/Docling runtime, cloud diagnostics, clean-machine deployment, and institutional acceptance are not verified by these results. Dependency provenance still needs the F05 reproducibility review. The synthetic notebook and diagnostic tests establish only the specific behaviors exercised above.
 
-F03, F05, and institutional production acceptance remain open. No Azure deployment or GitHub publication occurred.
+## Installation, registry preflight limitation, and cleanup
+
+The first installation preflight found existing Desktop and Start Menu shortcuts and stopped before installing. Both shortcuts were backed up with SHA-256 checks. The second attempt installed into `C:/Users/cruzmars/.cache/oeon-f03-installed-4a073c68f99645d38735b309831e9087`, then restored the pre-existing shortcuts.
+
+The initial registry check missed the 32-bit registry view. A prior 1.14.1 Electron installation existed at `C:/Program Files/Office of Equity Open Notebook`; the test installer temporarily replaced its 32-bit uninstall registration. This is a limitation of this acceptance run's preflight, not evidence of safe side-by-side installer behavior. Future runs must check both registry views or use a disposable Windows VM before installing.
+
+Before test cleanup, the unchanged prior install-location key was exported. The original application's package metadata, executable version, and shipped installer source established the correct 1.14.1 registration fields. Remaining registration fields were preserved through export. The test uninstaller ran only from the validated isolated target, and the prior install-location key and uninstall metadata were restored. No exact pre-test snapshot of the 32-bit uninstall key existed; restoration used verified installed metadata and preserved fields rather than claiming a byte-for-byte registry rollback.
+
+Observed cleanup results in `uninstall-result.json`:
+
+- Uninstaller exit code 0; test payload removed. A subsequent check confirmed the entire isolated target directory was absent.
+- Both original shortcuts matched their pre-test hashes.
+- Prior install-location key and uninstall registration point to the existing 1.14.1 installation again.
+- Existing 1.14.1 executable SHA-256 before and after cleanup: `8F131845F64A3742C808261C710DAB4217842E1E72BF4B434276569F0C36E09C`.
+
+Installed test helpers and `uninstall-test.ps1` remain in the ignored evidence folder. They were executed successfully for this test. The cleanup helper validates the target prefix, matching uninstall registration, prior installed metadata, and preserved executable hash. It is specific to this recorded test and should not be reused blindly for another installation.
