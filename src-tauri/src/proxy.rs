@@ -102,9 +102,9 @@ impl ApiProxyService {
                     Ok(res_builder.body(Body::from(bytes)).unwrap())
                 }
             }
-            Err(err) => {
+            Err(_) => {
                 let json_err = serde_json::json!({
-                    "error": format!("Bad Gateway: Upstream connection error to 127.0.0.1:5055: {}", err)
+                    "error": "UPSTREAM_CONNECTION_FAILED"
                 });
                 let res = Response::builder()
                     .status(StatusCode::BAD_GATEWAY)
@@ -114,5 +114,96 @@ impl ApiProxyService {
                 Ok(res)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    use hyper::service::{make_service_fn, service_fn};
+    use std::convert::Infallible;
+    use std::net::TcpListener;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const REQUEST_PATH: &str = "/api/search?query=SYNTHETIC_RECORD&token=SYNTHETIC_TOKEN";
+
+    async fn request_through_proxy(target: std::net::SocketAddr) -> (StatusCode, String) {
+        let proxy = ApiProxyService {
+            client: Client::builder().no_proxy().timeout(std::time::Duration::from_secs(5)).build().unwrap(),
+            target_base: format!("http://{}", target),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = hyper::Server::from_tcp(listener).unwrap().serve(make_service_fn(move |_| {
+            let proxy = proxy.clone();
+            async move {
+                Ok::<_, Infallible>(service_fn(move |request| {
+                    let proxy = proxy.clone();
+                    async move { proxy.handle_request(request).await }
+                }))
+            }
+        }));
+        let task = tokio::spawn(server);
+        let response = Client::builder().no_proxy().timeout(std::time::Duration::from_secs(5)).build().unwrap()
+            .get(format!("http://{}{}", address, REQUEST_PATH))
+            .send().await.unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        task.abort();
+        (status, body)
+    }
+
+    fn assert_safe_failure(status: StatusCode, body: &str) {
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(!body.contains("SYNTHETIC"), "Request data escaped into a host-generated error");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            serde_json::json!({"error": "UPSTREAM_CONNECTION_FAILED"})
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_failure_does_not_echo_request_url() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let (status, body) = request_through_proxy(address).await;
+        assert_safe_failure(status, &body);
+    }
+
+    #[tokio::test]
+    async fn malformed_upstream_does_not_echo_request_or_protocol_errors() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream.write_all(b"SYNTHETIC_EXCEPTION invalid HTTP response\r\n\r\n").await.unwrap();
+        });
+        let (status, body) = request_through_proxy(address).await;
+        upstream.await.unwrap();
+        assert_safe_failure(status, &body);
+    }
+
+    #[tokio::test]
+    async fn successful_backend_content_is_preserved() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = hyper::Server::from_tcp(listener).unwrap().serve(make_service_fn(|_| async {
+            Ok::<_, Infallible>(service_fn(|request: Request<Body>| async move {
+                assert_eq!(request.uri().path_and_query().unwrap().as_str(), REQUEST_PATH);
+                Ok::<_, Infallible>(Response::builder()
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"result":"SYNTHETIC_RECORD"}"#)).unwrap())
+            }))
+        }));
+        let upstream = tokio::spawn(server);
+        let (status, body) = request_through_proxy(address).await;
+        upstream.abort();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, r#"{"result":"SYNTHETIC_RECORD"}"#);
     }
 }

@@ -145,6 +145,11 @@ jobs:
       - name: Build Types
         run: npm run build:types
 
+      - name: Verify F03 Native Diagnostics
+        run: |
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --test service_diagnostics
+          cargo test --locked --manifest-path src-tauri/Cargo.toml --bin office-equity-host-tauri proxy::diagnostic_tests
+
       - name: Prepare Runtime
         run: node scripts/prepare-runtime.js --repo="${{ github.workspace }}/open-notebook"
 
