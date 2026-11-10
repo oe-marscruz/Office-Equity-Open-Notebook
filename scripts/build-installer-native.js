@@ -21,8 +21,8 @@ const path = require('path');
 const os = require('os');
 
 const PROJECT_DIR = path.join(__dirname, '..');
-const APP_DIR = path.join(PROJECT_DIR, 'out', 'Office of Equity Open Notebook');
-const DIST_DIR = path.join(PROJECT_DIR, 'dist');
+const APP_DIR = path.resolve(arg('--app', path.join(PROJECT_DIR, 'out', 'Office of Equity Open Notebook')));
+const DIST_DIR = path.resolve(arg('--out', path.join(PROJECT_DIR, 'dist')));
 const VERSION = '1.14.0';
 const PRODUCT_NAME = 'Office of Equity Open Notebook';
 const INSTALLER_NAME = `${PRODUCT_NAME}-${VERSION}-Setup.exe`;

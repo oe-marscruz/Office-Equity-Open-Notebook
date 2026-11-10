@@ -82,6 +82,13 @@ function main() {
   const productExe = path.join(appDir, productExeName);
   cp(exe, productExe);
 
+  // GNU Windows builds dynamically import this loader; keep it beside the EXE.
+  // MSVC builds may link the loader statically and emit no separate DLL.
+  const webviewLoader = path.join(path.dirname(exe), 'WebView2Loader.dll');
+  if (process.platform === 'win32' && fs.existsSync(webviewLoader)) {
+    cp(webviewLoader, path.join(appDir, 'WebView2Loader.dll'));
+  }
+
   // 4. Copy the bundled runtime into resources/runtime
   console.log('  copying bundled runtime (this is large)...');
   cp(RUNTIME_DIR, path.join(appDir, 'resources', 'runtime'));

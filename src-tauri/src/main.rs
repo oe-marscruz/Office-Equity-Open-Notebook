@@ -34,17 +34,15 @@ fn main() {
 
     tauri::Builder::default()
         .setup(move |app| {
-            // Start background services and embedded static/proxy server
-            tauri::async_runtime::spawn(async move {
-                if start_services(runtime_path.clone()).await.is_err() {
-                    let msg = "SERVICE_STARTUP_FAILED: Review the service lifecycle diagnostics.".to_owned();
-                    eprintln!("{}", msg);
-                    tauri::api::dialog::blocking::MessageDialogBuilder::new("Office of Equity Open Notebook — failed to start", &msg)
-                        .kind(tauri::api::dialog::MessageDialogKind::Error)
-                        .show();
-                    std::process::exit(1);
-                }
-            });
+            // Keep the window on a reachable allowed origin from its first navigation.
+            if tauri::async_runtime::block_on(start_services(runtime_path.clone())).is_err() {
+                let msg = "SERVICE_STARTUP_FAILED: Review the service lifecycle diagnostics.";
+                eprintln!("{}", msg);
+                tauri::api::dialog::blocking::MessageDialogBuilder::new("Office of Equity Open Notebook - failed to start", msg)
+                    .kind(tauri::api::dialog::MessageDialogKind::Error)
+                    .show();
+                std::process::exit(1);
+            }
 
             // Create the main window with the navigation security policy applied
             let config = window_config.clone().unwrap_or_default();

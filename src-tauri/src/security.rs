@@ -50,6 +50,11 @@ pub fn decide_navigation(url: &tauri::Url) -> NavigationAction {
     NavigationAction::Deny
 }
 
+fn embedded_app_url() -> tauri::Url {
+    tauri::Url::parse(&format!("http://{}:{}/", LOCAL_HOST, LOCAL_PORT))
+        .expect("fixed embedded app origin is valid")
+}
+
 /// Creates the single application window and installs the navigation security policy on it.
 ///
 /// The window is built from the `tauri.conf.json` window configuration so geometry and title
@@ -58,7 +63,7 @@ pub fn build_secured_window(
     app: &mut App,
     mut config: WindowConfig,
 ) -> Result<Window, Box<dyn std::error::Error>> {
-    config.url = WindowUrl::App("index.html".into());
+    config.url = WindowUrl::External(embedded_app_url());
 
     let shell_scope: ShellScope = app.shell_scope();
 
@@ -78,6 +83,12 @@ pub fn build_secured_window(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn initial_window_url_uses_the_allowed_embedded_server() {
+        let url = super::embedded_app_url();
+        assert_eq!(super::decide_navigation(&url), super::NavigationAction::Allow);
+        assert_eq!(url.as_str(), "http://127.0.0.1:8502/");
+    }
     use super::*;
 
     fn url(s: &str) -> tauri::Url {
